@@ -20,10 +20,7 @@ A lightweight, self-hosted AI Agent framework written in Go.
 
 FastClaw is a self-hosted AI agent runtime. It connects your LLM to chat platforms, executes tools, manages memory, and runs scheduled tasks — all from a single Go binary with zero dependencies.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/fastclaw-ai/fastclaw/main/install.sh | bash
-fastclaw    # Opens setup wizard in browser
-```
+See [Installation](#-install) below to get started.
 
 ## 📦 Install
 
@@ -33,7 +30,13 @@ fastclaw    # Opens setup wizard in browser
 curl -fsSL https://raw.githubusercontent.com/fastclaw-ai/fastclaw/main/install.sh | bash
 ```
 
-**Windows:** Download `.zip` from [Releases](https://github.com/fastclaw-ai/fastclaw/releases), extract, double-click `fastclaw.exe`.
+**One-liner (Windows):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iex(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fastclaw-ai/fastclaw/main/install.ps1')"
+```
+
+**Manual Windows:** Download `.zip` from [Releases](https://github.com/fastclaw-ai/fastclaw/releases), extract, double-click `fastclaw.exe`.
 
 **Already installed?**
 
