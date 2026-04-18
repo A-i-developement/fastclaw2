@@ -37,8 +37,10 @@ type Agent struct {
 	temperature       float64
 	maxToolIterations int
 	thinking          string
-	workspacePath     string
-	homeDir           string
+	homePath          string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath     string // working dir where agent creates user files
+	homeDir           string // FastClaw root, ~/.fastclaw
+	ownerUserID       string // the user that owns this agent (for hook namespacing)
 	skillsCfg         config.SkillsConfig
 	globalSkillsCfg   config.SkillsCfg
 	messageBus        *bus.MessageBus
@@ -67,7 +69,7 @@ func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bu
 	if fullCfg.Memory.FTS.Enabled {
 		dbPath := fullCfg.Memory.FTS.DBPath
 		if dbPath == "" {
-			dbPath = rc.Workspace + "/memory/fts.db"
+			dbPath = rc.Home + "/memory/fts.db"
 		}
 		if fts, err := store.NewFTSStore(dbPath); err == nil {
 			if err := fts.Init(); err == nil {
@@ -87,8 +89,8 @@ func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bu
 		if model == "" {
 			model = rc.Model
 		}
-		learnerLoader := NewSkillsLoaderWithGlobal(homeDir, rc.Workspace, "", rc.Skills, fullCfg.Skills)
-		ag.skillsLearner = NewSkillsLearner(rc.Workspace, prov, model, learnerLoader.AllSkillDirs()...)
+		learnerLoader := NewSkillsLoaderWithGlobal(homeDir, rc.Home, "", rc.Skills, fullCfg.Skills)
+		ag.skillsLearner = NewSkillsLearner(rc.Home, prov, model, learnerLoader.AllSkillDirs()...)
 		if fullCfg.SkillsLearner.MinToolCalls > 0 {
 			ag.skillsLearner.minToolCalls = fullCfg.SkillsLearner.MinToolCalls
 		}
@@ -104,15 +106,27 @@ func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bu
 
 // NewAgentWithSkillsCfg creates a new Agent with global skills config for env injection.
 func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string, globalSkillsCfg config.SkillsCfg) *Agent {
-	memory := NewMemory(rc.Workspace)
-	registry := tools.NewRegistry(rc.Workspace)
+	workspace := rc.Workspace
+	if workspace == "" {
+		// Fallback for callers (tests, legacy configs) that don't populate
+		// Workspace — use the agent's home as a single-dir fallback.
+		workspace = rc.Home
+	}
+	// Ensure the workspace dir exists so the first write_file doesn't fail.
+	if workspace != "" {
+		_ = os.MkdirAll(workspace, 0o755)
+	}
+
+	memory := NewMemory(rc.Home)
+	registry := tools.NewRegistry(rc.Home, workspace)
 	tools.RegisterMessage(registry, mb)
-	tools.RegisterMemorySearch(registry, rc.Workspace)
+	tools.RegisterMemorySearch(registry, rc.Home)
 	tools.RegisterWebFetch(registry)
-	tools.RegisterLoadSkill(registry, homeDir, rc.Workspace, "")
+	tools.RegisterLoadSkill(registry, homeDir, rc.Home, "")
+	tools.RegisterSkillInstall(registry, 0) // 0 = use default port 18953
 
 	// Load skills with OpenClaw compatibility
-	loader := NewSkillsLoaderWithGlobal(homeDir, rc.Workspace, "", rc.Skills, globalSkillsCfg)
+	loader := NewSkillsLoaderWithGlobal(homeDir, rc.Home, "", rc.Skills, globalSkillsCfg)
 	skills := loader.LoadSkills()
 	skillsSummary := loader.BuildSkillsSummary(skills)
 
@@ -137,16 +151,17 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		name:              rc.ID,
 		provider:          prov,
 		registry:          registry,
-		sessions:          session.NewManager(rc.Workspace + "/sessions"),
+		sessions:          session.NewManager(rc.Home + "/sessions"),
 		memory:            memory,
-		ctxBuilder:        newContextBuilderWithThinking(rc.Workspace, memory, skillsSummary, rc.Thinking),
+		ctxBuilder:        newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, rc.Sandbox.Enabled, rc.Sandbox.Backend),
 		hooks:             hooks,
 		model:             rc.Model,
 		maxTokens:         rc.MaxTokens,
 		temperature:       rc.Temperature,
 		maxToolIterations: rc.MaxToolIterations,
 		thinking:          rc.Thinking,
-		workspacePath:     rc.Workspace,
+		homePath:          rc.Home,
+		workspacePath:     workspace,
 		homeDir:           homeDir,
 		skillsCfg:         rc.Skills,
 		globalSkillsCfg:   globalSkillsCfg,
@@ -177,11 +192,19 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	return ag
 }
 
-func newContextBuilderWithThinking(workspace string, memory *Memory, skillsSummary string, thinking string) *ContextBuilder {
-	cb := NewContextBuilder(workspace, memory, skillsSummary)
+func newContextBuilderWithThinking(home string, memory *Memory, skillsSummary string, thinking string) *ContextBuilder {
+	cb := NewContextBuilder(home, memory, skillsSummary)
 	if thinking != "" {
 		cb.SetThinking(thinking)
 	}
+	return cb
+}
+
+func newContextBuilderWithSandbox(home, workspace string, memory *Memory, skillsSummary string, thinking string, sandboxEnabled bool, sandboxBackend string) *ContextBuilder {
+	cb := newContextBuilderWithThinking(home, memory, skillsSummary, thinking)
+	cb.SetWorkspace(workspace)
+	cb.sandboxEnabled = sandboxEnabled
+	cb.sandboxBackend = sandboxBackend
 	return cb
 }
 
@@ -221,9 +244,9 @@ func (a *Agent) HandleWebChatStream(ctx context.Context, sessionId, text string,
 	return a.HandleMessage(ctx, msg)
 }
 
-// workspace returns the agent's workspace path.
-func (a *Agent) workspace() string {
-	return a.workspacePath
+// home returns the agent's home (metadata) directory path.
+func (a *Agent) home() string {
+	return a.homePath
 }
 
 // SetGroupContext configures group chat awareness for this agent's system prompt.
@@ -253,6 +276,13 @@ func (a *Agent) SetSubAgentSpawner(spawner tools.SubAgentSpawner) {
 // ToolRegistry returns the agent's tool registry for external registration.
 func (a *Agent) ToolRegistry() *tools.Registry {
 	return a.registry
+}
+
+// SetOwnerUserID tags this agent with the owning user ID. The value is
+// propagated into every HookContext so plugins like mem0 can namespace
+// data per user.
+func (a *Agent) SetOwnerUserID(uid string) {
+	a.ownerUserID = uid
 }
 
 // HookRegistry returns the agent's hook registry for external hook registration.
@@ -320,9 +350,19 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 	return history
 }
 
-// WebChatSessions returns a list of web chat sessions with their first user message as preview.
-func (a *Agent) WebChatSessions() []map[string]string {
+// WebChatSessions returns a list of web chat sessions with metadata.
+func (a *Agent) WebChatSessions() []session.WebSession {
 	return a.sessions.ListWebSessions()
+}
+
+// DeleteWebChatSession removes a web chat session.
+func (a *Agent) DeleteWebChatSession(sessionId string) error {
+	return a.sessions.DeleteWebSession(sessionId)
+}
+
+// RenameWebChatSession sets a custom title for a web chat session.
+func (a *Agent) RenameWebChatSession(sessionId, title string) error {
+	return a.sessions.RenameWebSession(sessionId, title)
 }
 
 // Model returns the agent's model name.
@@ -347,12 +387,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	sess := a.sessions.Get(msg.Channel, msg.ChatID)
 
 	// Hook: BeforeSystemPrompt
-	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt})
+	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 
 	systemPrompt := a.ctxBuilder.BuildSystemPrompt()
 
 	// Hook: AfterSystemPrompt
-	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt})
+	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
 
 	// Store the raw user message
 	userMsg := provider.Message{Role: "user", Content: msg.Text}
@@ -367,7 +407,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	// Context compaction: check if session messages are too large
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.workspacePath, a.provider, a.model)
+	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -403,7 +443,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		)
 
 		// Hook: BeforeModelCall
-		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, ChatID: msg.ChatID}
+		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
 
 		// PII scrubbing: redact sensitive data before sending to LLM
@@ -415,7 +455,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		resp, err := a.provider.Chat(ctx, llmMessages, toolDefs, a.model, a.maxTokens, a.temperature)
 
 		// Hook: AfterModelCall
-		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, ChatID: msg.ChatID}
+		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
@@ -424,7 +464,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 
 		if !resp.HasToolCalls() {
-			sess.Append(provider.Message{Role: "assistant", Content: resp.Content})
+			sess.Append(provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant})
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			a.runPostTurn(ctx, messages, totalToolCalls)
@@ -446,9 +486,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 
 		assistantMsg := provider.Message{
-			Role:      "assistant",
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
+			Role:         "assistant",
+			Content:      resp.Content,
+			ToolCalls:    resp.ToolCalls,
+			Thinking:     resp.Thinking,
+			Timestamp:    time.Now().UnixMilli(),
+			RawAssistant: resp.RawAssistant,
 		}
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
@@ -489,6 +532,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				Point:     BeforeToolCall,
 				ToolName:  tc.Function.Name,
 				ToolArgs:  tc.Function.Arguments,
+				UserID:    a.ownerUserID,
 			})
 		}
 
@@ -511,6 +555,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				ToolName:   r.toolName,
 				ToolResult: r.result,
 				Error:      r.err,
+				UserID:     a.ownerUserID,
 			})
 
 			if r.err != nil {
@@ -573,7 +618,8 @@ func (a *Agent) runPostTurn(ctx context.Context, messages []provider.Message, to
 		Messages:      messages,
 		TurnCount:     a.turnCount,
 		ToolCallCount: toolCallCount,
-		Workspace:     a.workspacePath,
+		Workspace:     a.homePath,
+		UserID:        a.ownerUserID,
 	})
 
 	// Auto-persist memory every N turns
@@ -610,9 +656,9 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	}
 
 	sess := a.sessions.Get(msg.Channel, msg.ChatID)
-	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt})
+	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 	systemPrompt := a.ctxBuilder.BuildSystemPrompt()
-	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt})
+	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
 
 	// Store raw user message
 	userMsg := provider.Message{Role: "user", Content: msg.Text}
@@ -626,7 +672,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	sess.Append(userMsg)
 
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.workspacePath, a.provider, a.model)
+	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -650,12 +696,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
-		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, ChatID: msg.ChatID}
+		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
 
 		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 
-		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, ChatID: msg.ChatID}
+		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
@@ -699,9 +745,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		// Tool calls - process concurrently via SDK engine
 		assistantMsg := provider.Message{
-			Role:      "assistant",
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
+			Role:         "assistant",
+			Content:      resp.Content,
+			ToolCalls:    resp.ToolCalls,
+			Thinking:     resp.Thinking,
+			Timestamp:    time.Now().UnixMilli(),
+			RawAssistant: resp.RawAssistant,
 		}
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
@@ -737,7 +786,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		// Fire BeforeToolCall hooks
 		for _, tc := range resp.ToolCalls {
-			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeToolCall, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
+			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeToolCall, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, UserID: a.ownerUserID})
 		}
 
 		// Execute tools concurrently via SDK engine
@@ -745,7 +794,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		for idx, r := range results {
 			tc := resp.ToolCalls[idx]
-			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterToolCall, ToolName: r.toolName, ToolResult: r.result, Error: r.err})
+			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterToolCall, ToolName: r.toolName, ToolResult: r.result, Error: r.err, UserID: a.ownerUserID})
 
 			if r.err != nil {
 				slog.Warn("tool execution error", "agent", a.name, "name", r.toolName, "error", r.err)
@@ -774,7 +823,12 @@ func (a *Agent) stringStream(text string) *provider.StreamReader {
 	return provider.NewStreamReader(ch)
 }
 
-// WorkspacePath returns the agent's workspace directory.
+// HomePath returns the agent's home directory (identity/metadata).
+func (a *Agent) HomePath() string {
+	return a.homePath
+}
+
+// WorkspacePath returns the agent's working directory for user-facing files.
 func (a *Agent) WorkspacePath() string {
 	return a.workspacePath
 }
@@ -790,12 +844,13 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 // ReloadWorkspaceFiles re-reads workspace .md files (SOUL.md, AGENTS.md, etc.)
 // and rebuilds the context builder.
 func (a *Agent) ReloadWorkspaceFiles() {
-	a.memory = NewMemory(a.workspacePath)
+	a.memory = NewMemory(a.homePath)
 	// Rebuild skills summary
-	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.workspacePath, "", a.skillsCfg, a.globalSkillsCfg)
+	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg)
 	skills := loader.LoadSkills()
 	skillsSummary := loader.BuildSkillsSummary(skills)
-	a.ctxBuilder = NewContextBuilder(a.workspacePath, a.memory, skillsSummary)
+	a.ctxBuilder = NewContextBuilder(a.homePath, a.memory, skillsSummary)
+	a.ctxBuilder.SetWorkspace(a.workspacePath)
 }
 
 // extractMediaPaths scans tool output for MEDIA: lines and returns file paths.
