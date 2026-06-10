@@ -119,6 +119,9 @@ func toAPIMessages(msgs []Message) []json.RawMessage {
 			ToolCallID: m.ToolCallID,
 			Name:       m.Name,
 		}
+		if m.Role == "assistant" && m.Thinking != "" {
+			am.ReasoningContent = m.Thinking
+		}
 		if !orphanAssistant[i] {
 			am.ToolCalls = m.ToolCalls
 		}
