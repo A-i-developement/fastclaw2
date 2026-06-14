@@ -5,8 +5,9 @@ import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { fileUrl, getAgent, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, listAgentFiles, listProjects, renameChatSession, revealAgentWorkspace, sendChatStream, steerChat, uploadAgentFiles, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile } from "@/lib/api";
-import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, FolderSearch, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw, Eye, Code2, RotateCcw, ListChecks, Terminal } from "lucide-react";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { fileUrl, getAgent, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, listAgentFiles, listProjects, renameChatSession, revealAgentWorkspace, sendChatStream, steerChat, uploadAgentFiles, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile } from "@/lib/api";
+import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Folder, FolderSearch, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw, Eye, Code2, RotateCcw, ListChecks, Terminal, ExternalLink, MoreHorizontal } from "lucide-react";
 import Link from "next/link";
 import { ChatMarkdown } from "@/components/chat-markdown";
 
@@ -88,6 +89,7 @@ function renderContentWithDataImages(
 }
 
 import { usePageHeader } from "@/components/sidebar";
+import { useSidebarOptional } from "@/components/ui/sidebar";
 import { channelLabel } from "@/components/channel-icon";
 
 interface ProducedFile {
@@ -509,6 +511,15 @@ export function ChatScreen() {
   }>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [filesSheetOpen, setFilesSheetOpen] = useState(false);
+  // Opening the workspace/preview panel collapses the platform sidebar to
+  // free horizontal room (null when there's no provider, e.g. act-as view).
+  const sidebar = useSidebarOptional();
+  useEffect(() => {
+    if (filesSheetOpen) sidebar?.setOpen(false);
+    // Intentionally keyed only on filesSheetOpen: collapse once when the
+    // panel opens; don't fight the user if they re-expand while it's open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filesSheetOpen]);
   const [sessionTitle, setSessionTitle] = useState<string>("");
   const [attachments, setAttachments] = useState<File[]>([]);
   // Lightbox for clicking either an attachment thumbnail (compose box)
@@ -956,6 +967,17 @@ export function ChatScreen() {
       setMessages([]);
     }
   }, [urlSessionId, sessionId]);
+
+  // Clicking "New chat" lands on the bare /chat/ route (no session, no
+  // project) — close the workspace panel so the previous chat's file
+  // tree doesn't linger over a fresh, empty conversation. Keyed on the
+  // URL ids, not on every render, so the user can still re-open the
+  // panel manually within the new chat without it snapping shut.
+  useEffect(() => {
+    if (!urlSessionId && !urlProjectId) {
+      setFilesSheetOpen(false);
+    }
+  }, [urlSessionId, urlProjectId]);
 
   // Keep the local sessionTitle in sync with the session list. Unknown
   // sessions (brand-new, not saved yet) fall back to empty so the header
@@ -1957,8 +1979,8 @@ export function ChatScreen() {
                     .map((r) => (
                       <FilesPanel
                         key={`files-${r.id}`}
-                        agentId={selectedAgent}
                         files={r.files!}
+                        onOpen={() => setFilesSheetOpen(true)}
                       />
                     ));
                   if (rounds.length === 1) {
@@ -2161,7 +2183,7 @@ export function ChatScreen() {
                       )}
                     </div>
                     {msg.files && msg.files.length > 0 && (
-                      <FilesPanel agentId={selectedAgent} files={msg.files} />
+                      <FilesPanel files={msg.files} onOpen={() => setFilesSheetOpen(true)} />
                     )}
                     <div
                       className={`flex items-center gap-1.5 mt-1 ${
@@ -2911,62 +2933,56 @@ function zipUrl(agentId: string, sessionId: string, projectId?: string): string 
   return `/api/agents/${agentId}/files.zip${qs ? "?" + qs : ""}`;
 }
 
-function FilesPanel({ agentId, files }: { agentId: string; files: ProducedFile[] }) {
-  const [previewing, setPreviewing] = useState<ProducedFile | null>(null);
+// FilesPanel no longer inlines the produced-file list into the message
+// bubble — a long workspace (skills/, .DS_Store, lockfiles, …) buried the
+// reply. Instead it surfaces a single "Open files" affordance that opens
+// the WorkspacePanel side sheet, which already handles the tree, preview,
+// and download. onOpen is wired to setFilesSheetOpen(true) at the call site.
+// BuildLogView renders the live scaffold/dev log as a scrolling terminal,
+// auto-pinned to the bottom so the latest pnpm-install lines stay visible.
+function BuildLogView({ text }: { text: string }) {
+  const ref = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text]);
   return (
-    <>
-      <div className="mt-2 space-y-1.5 max-w-[85%]">
-        <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">
-          Your files
-        </p>
-        <div className="flex flex-col gap-1.5">
-          {files.map((f) => {
-            const { icon: Icon } = fileKind(f.path);
-            const basename = f.path.split("/").pop() || f.path;
-            const downloadUrl = fileUrl(agentId, f.path, true);
-            return (
-              <div
-                key={f.path}
-                className="group flex items-center gap-2.5 rounded-lg border border-border bg-card/50 px-3 py-2 hover:bg-card/80 transition-colors"
-              >
-                <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
-                <button
-                  onClick={() => setPreviewing(f)}
-                  className="flex-1 min-w-0 text-left"
-                  title="Open preview"
-                >
-                  <div className="text-sm font-medium text-foreground truncate">{basename}</div>
-                  {f.size !== undefined && (
-                    <div className="text-[11px] text-muted-foreground/70">{formatBytes(f.size)}</div>
-                  )}
-                </button>
-                <a
-                  href={downloadUrl}
-                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-                  title="Download"
-                >
-                  <Download className="h-4 w-4" />
-                </a>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-      {previewing && (
-        <FilePreview
-          agentId={agentId}
-          file={previewing}
-          onClose={() => setPreviewing(null)}
-        />
-      )}
-    </>
+    <pre
+      ref={ref}
+      className="h-full w-full overflow-auto whitespace-pre-wrap break-words bg-zinc-950 px-4 py-3 text-left font-mono text-[11px] leading-relaxed text-zinc-300"
+    >
+      {text || "Starting build…"}
+    </pre>
+  );
+}
+
+function FilesPanel({ files, onOpen }: { files: ProducedFile[]; onOpen: () => void }) {
+  return (
+    <div className="mt-2 max-w-[85%]">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="group inline-flex items-center gap-2 rounded-lg border border-border bg-card/50 px-3 py-2 hover:bg-card/80 transition-colors"
+        title="Open workspace files"
+      >
+        <FolderOpen className="h-4 w-4 text-muted-foreground shrink-0 group-hover:text-foreground transition-colors" />
+        <span className="text-sm font-medium text-foreground">Open files</span>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/80 tabular-nums">
+          {files.length}
+        </span>
+      </button>
+    </div>
   );
 }
 
 const FILES_PANEL_MIN = 280;
-const FILES_PANEL_MAX = 640;
+const FILES_PANEL_MAX = 1000; // wide enough to view a desktop preview iframe
 const FILES_PANEL_DEFAULT = 280;
 const FILES_PANEL_KEY = "chat:filesPanelWidth";
+// When the user switches to the Preview tab and the panel is still narrow,
+// auto-grow to this so the embedded site isn't cramped. Transient (not
+// persisted), so the Code tab keeps its own saved width.
+const PREVIEW_AUTO_WIDTH = 760;
 
 // WorkspacePanel renders the files in the active scope:
 //   - chat scope (sessionId set): files produced in this conversation.
@@ -2980,6 +2996,175 @@ const FILES_PANEL_KEY = "chat:filesPanelWidth";
 // The agent's shared files (SKILL.md / main.py / templates) are
 // excluded by the backend's scope filter so they can't leak into
 // either view and confuse "what did this conversation produce".
+// --- Workspace directory tree ---
+
+type FileTreeNode = {
+  name: string;
+  path: string; // full workspace-relative path (files) or the folder path (dirs)
+  isDir: boolean;
+  size?: number;
+  children: FileTreeNode[];
+};
+
+// buildFileTree turns the flat file list into a nested tree. stripPrefix (e.g.
+// "sessions/<sid>/") is removed for the tree STRUCTURE so the session/project
+// folder is the implicit root — but file leaves keep their FULL path, which the
+// preview/download URLs need. Folders are synthesized from the remaining
+// segments; their `path` is the relative path (a stable, unique toggle key).
+function buildFileTree(files: WorkspaceFile[], stripPrefix: string): FileTreeNode[] {
+  const root: FileTreeNode = { name: "", path: "", isDir: true, children: [] };
+  for (const f of files) {
+    const rel = stripPrefix && f.path.startsWith(stripPrefix)
+      ? f.path.slice(stripPrefix.length)
+      : f.path;
+    const parts = rel.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+    let node = root;
+    for (let i = 0; i < parts.length; i++) {
+      const isLeaf = i === parts.length - 1;
+      const name = parts[i];
+      let child = node.children.find((c) => c.name === name && c.isDir === !isLeaf);
+      if (!child) {
+        child = isLeaf
+          ? { name, path: f.path, isDir: false, size: f.size, children: [] }
+          : { name, path: parts.slice(0, i + 1).join("/"), isDir: true, children: [] };
+        node.children.push(child);
+      }
+      node = child;
+    }
+  }
+  sortFileTree(root.children);
+  return root.children;
+}
+
+function sortFileTree(nodes: FileTreeNode[]) {
+  nodes.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // folders before files
+    return a.name.localeCompare(b.name);
+  });
+  for (const n of nodes) if (n.isDir) sortFileTree(n.children);
+}
+
+function FileTreeView({
+  files,
+  rootPrefix,
+  selectedPath,
+  onSelect,
+}: {
+  files: WorkspaceFile[];
+  rootPrefix: string;
+  selectedPath?: string;
+  onSelect: (f: ProducedFile) => void;
+}) {
+  const tree = useMemo(() => buildFileTree(files, rootPrefix), [files, rootPrefix]);
+  // Default collapsed: only the top level shows; the user expands folders as
+  // needed. Expansion state keys on stable relative paths, so it survives
+  // refreshes.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggle = useCallback((path: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+  return (
+    <div className="text-sm">
+      {tree.map((n) => (
+        <FileTreeRow
+          key={n.path}
+          node={n}
+          depth={0}
+          expanded={expanded}
+          toggle={toggle}
+          selectedPath={selectedPath}
+          onSelect={onSelect}
+        />
+      ))}
+    </div>
+  );
+}
+
+function FileTreeRow({
+  node,
+  depth,
+  expanded,
+  toggle,
+  selectedPath,
+  onSelect,
+}: {
+  node: FileTreeNode;
+  depth: number;
+  expanded: Set<string>;
+  toggle: (p: string) => void;
+  selectedPath?: string;
+  onSelect: (f: ProducedFile) => void;
+}) {
+  const pad = { paddingLeft: 8 + depth * 14 };
+  if (node.isDir) {
+    const open = expanded.has(node.path);
+    return (
+      <>
+        <button
+          onClick={() => toggle(node.path)}
+          style={pad}
+          className="flex w-full items-center gap-1.5 py-1 pr-2 rounded-md text-left hover:bg-muted/40"
+        >
+          {open ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          )}
+          <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="truncate text-foreground">{node.name}</span>
+        </button>
+        {open &&
+          node.children.map((c) => (
+            <FileTreeRow
+              key={c.path}
+              node={c}
+              depth={depth + 1}
+              expanded={expanded}
+              toggle={toggle}
+              selectedPath={selectedPath}
+              onSelect={onSelect}
+            />
+          ))}
+      </>
+    );
+  }
+  const { icon: Icon } = fileKind(node.path);
+  const active = selectedPath === node.path;
+  return (
+    <button
+      onClick={() => onSelect({ path: node.path, size: node.size })}
+      style={pad}
+      className={`flex w-full items-center gap-1.5 py-1 pr-2 rounded-md text-left ${active ? "bg-muted" : "hover:bg-muted/40"}`}
+      title={node.path}
+    >
+      <span className="w-3.5 shrink-0" />
+      <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+      <span className="truncate text-foreground">{node.name}</span>
+    </button>
+  );
+}
+
+// langForPath maps a file extension to a Shiki language id so the code
+// preview can syntax-highlight via the markdown code-fence renderer.
+function langForPath(path: string): string {
+  const ext = path.toLowerCase().split(".").pop() || "";
+  const map: Record<string, string> = {
+    ts: "ts", tsx: "tsx", js: "js", jsx: "jsx", mjs: "js", cjs: "js",
+    json: "json", css: "css", scss: "scss", html: "html", htm: "html",
+    py: "python", go: "go", rs: "rust", rb: "ruby", java: "java",
+    c: "c", cpp: "cpp", h: "c", sh: "bash", bash: "bash", zsh: "bash",
+    yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml", sql: "sql",
+    md: "markdown", markdown: "markdown",
+  };
+  return map[ext] || "text";
+}
+
 function WorkspacePanel({
   agentId,
   sessionId,
@@ -2994,6 +3179,17 @@ function WorkspacePanel({
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [previewing, setPreviewing] = useState<ProducedFile | null>(null);
+  // Live dev-server preview for this chat scope (from start_app_preview).
+  const [appPreview, setAppPreview] = useState<ScopePreview>({ status: "none" });
+  // Live build/dev log tail, shown in the preview pane while the app is
+  // scaffolding so "Building…" isn't an opaque spinner.
+  const [buildLogs, setBuildLogs] = useState("");
+  // Code (file tree) vs Preview (embedded iframe of the running dev server).
+  const [tab, setTab] = useState<"code" | "preview">("code");
+  // Files the agent changed vs the template baseline (so the tree can show
+  // just this task's output), and whether to show all files instead.
+  const [changed, setChanged] = useState<{ files: WorkspaceFile[]; available: boolean }>({ files: [], available: false });
+  const [showAll, setShowAll] = useState(false);
   // Self-hosted-only "open in Finder" affordance. We learn the deploy
   // mode from /api/me on mount; it doesn't change at runtime, so one
   // fetch per panel instance is enough. Hosted deployments leave this
@@ -3023,6 +3219,24 @@ function WorkspacePanel({
     return FILES_PANEL_DEFAULT;
   });
   const [resizing, setResizing] = useState(false);
+
+  // Measure the panel's ACTUAL rendered width (not the `width` state, which
+  // the CSS maxWidth cap can shrink below on small viewports) so the header
+  // can collapse its toolbar before it overflows and pushes a page scroll.
+  const asideRef = useRef<HTMLElement>(null);
+  const [panelW, setPanelW] = useState<number>(FILES_PANEL_DEFAULT);
+  useEffect(() => {
+    const el = asideRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) setPanelW(e.contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // Below this the secondary action icons fold into a "⋯" menu and the
+  // "Files" label drops, so the header always fits the narrow panel.
+  const compactHeader = panelW < 480;
 
   useEffect(() => {
     if (!resizing) return;
@@ -3085,6 +3299,14 @@ function WorkspacePanel({
         .filter((f) => !isSystemFile(f.path))
         .sort((a, b) => (b.modTime || 0) - (a.modTime || 0));
       setFiles(cleaned);
+      // Best-effort: is there a live app preview for this scope?
+      getScopePreview(agentId, projectId ? undefined : sessionId, projectId)
+        .then(setAppPreview)
+        .catch(() => setAppPreview({ status: "none" }));
+      // Best-effort: which files did the agent change vs the template?
+      getChangedFiles(agentId, projectId ? undefined : sessionId, projectId)
+        .then(setChanged)
+        .catch(() => setChanged({ files: [], available: false }));
     } finally {
       setLoading(false);
     }
@@ -3094,15 +3316,56 @@ function WorkspacePanel({
     refresh();
   }, [refresh]);
 
+  // While the Preview tab is open, poll the runtime so a "building" preview
+  // flips to the live iframe on its own (and reflects sleep/crash). Cheap
+  // local call; stops when the tab closes.
+  useEffect(() => {
+    if (tab !== "preview") return;
+    let active = true;
+    const sid = projectId ? undefined : sessionId;
+    const poll = async () => {
+      const p = await getScopePreview(agentId, sid, projectId).catch(() => null);
+      if (!active || !p) return;
+      setAppPreview(p);
+      // While building, tail the live install/dev output for the log pane.
+      if (p.status === "scaffolding" || p.status === "starting") {
+        const logs = await getScopePreviewLogs(agentId, sid, projectId).catch(() => "");
+        if (active) setBuildLogs(logs);
+      }
+    };
+    poll();
+    const t = setInterval(poll, 4000);
+    return () => {
+      active = false;
+      clearInterval(t);
+    };
+  }, [tab, agentId, sessionId, projectId]);
+
+  // Auto-grow the panel when entering Preview so the embedded site isn't
+  // cramped. Transient — not written to localStorage, so the Code tab keeps
+  // its own saved width and dragging still wins.
+  useEffect(() => {
+    if (tab === "preview") {
+      setWidth((w) => (w < PREVIEW_AUTO_WIDTH ? Math.min(PREVIEW_AUTO_WIDTH, FILES_PANEL_MAX) : w));
+    }
+  }, [tab]);
+
   return (
     <>
       <aside
-        style={{ width }}
-        className="relative z-30 hidden md:flex shrink-0 flex-col border-l border-border bg-background -mt-12 h-screen"
+        ref={asideRef}
+        // width is the dragged/auto px width, but cap it to the viewport so
+        // the panel (shrink-0) + the platform sidebar can never exceed the
+        // window and force a horizontal page scroll. 26rem reserve keeps the
+        // sidebar (~16rem) plus a usable chat sliver visible; min() lets it
+        // grow to FILES_PANEL_MAX on wide screens. overflow-hidden is the
+        // belt-and-suspenders so no inner content can push the page wide.
+        style={{ width, maxWidth: `min(${FILES_PANEL_MAX}px, calc(100vw - 26rem))` }}
+        className="relative z-30 hidden md:flex shrink-0 flex-col overflow-hidden border-l border-border bg-background -mt-12 h-screen"
       >
         <div
           onMouseDown={(e) => { e.preventDefault(); setResizing(true); }}
-          className={`absolute -left-1 top-0 bottom-0 w-2 cursor-col-resize z-10 group ${resizing ? "" : ""}`}
+          className={`absolute left-0 top-0 bottom-0 w-2 cursor-col-resize z-10 group ${resizing ? "" : ""}`}
           title="Drag to resize"
         >
           <div
@@ -3111,107 +3374,236 @@ function WorkspacePanel({
             }`}
           />
         </div>
-        <div className="flex items-center justify-between gap-2 px-4 h-12 border-b border-border">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <FolderOpen className="h-4 w-4" />
-            Workspace
+        <div className="flex h-12 items-center justify-between gap-2 border-b border-border px-4">
+          <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+            <FolderOpen className="h-4 w-4 shrink-0" />
+            {!compactHeader && <span className="truncate">Files</span>}
           </div>
-          <div className="flex items-center gap-1">
-            <a
-              href={
-                files.length > 0
-                  ? zipUrl(agentId, sessionId, projectId)
-                  : undefined
-              }
-              aria-disabled={files.length === 0}
-              className={`p-1.5 rounded-md transition-colors ${
-                files.length === 0
-                  ? "text-muted-foreground/40 pointer-events-none"
-                  : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
-              }`}
-              title="Download all as zip"
-            >
-              <Download className="h-4 w-4" />
-            </a>
-            {/* Open the workspace folder in the operator's native file
-                browser. Self-hosted only — hosted deployments don't
-                expose a meaningful "local folder" so the button is
-                hidden entirely (we learned the mode from /api/me at
-                mount). */}
-            {deployMode === "self-hosted" && (
+          <div className="flex shrink-0 items-center gap-1">
+            {/* Code (file tree) ⇄ Preview (live dev server iframe) toggle. */}
+            <div className="mr-1 flex items-center rounded-md bg-muted p-0.5 text-xs">
               <button
-                onClick={handleReveal}
-                disabled={revealing || (!sessionId && !projectId)}
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors disabled:opacity-50"
-                title="Open folder in Finder"
+                onClick={() => setTab("code")}
+                className={`rounded px-2.5 py-1 transition-colors ${
+                  tab === "code"
+                    ? "bg-background font-medium text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
               >
-                <FolderSearch className="h-4 w-4" />
+                Code
               </button>
+              <button
+                onClick={() => setTab("preview")}
+                className={`flex items-center gap-1 rounded px-2.5 py-1 transition-colors ${
+                  tab === "preview"
+                    ? "bg-background font-medium text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Preview
+                {(appPreview.status === "starting" || appPreview.status === "scaffolding") && (
+                  <RefreshCw className="h-3 w-3 animate-spin" />
+                )}
+              </button>
+            </div>
+            {/* Secondary actions: inline on a wide panel, folded into a "⋯"
+                menu when the panel is narrow so the toolbar never overflows
+                and pushes a horizontal page scroll. */}
+            {compactHeader ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <button
+                      className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                      title="More actions"
+                    >
+                      <MoreHorizontal className="h-4 w-4" />
+                    </button>
+                  }
+                />
+                <DropdownMenuContent align="end" className="w-44 rounded-lg">
+                  {appPreview.status === "running" && appPreview.previewUrl && (
+                    <DropdownMenuItem
+                      onClick={() =>
+                        window.open(appPreview.previewUrl!, "_blank", "noopener,noreferrer")
+                      }
+                    >
+                      <ExternalLink className="h-4 w-4 text-muted-foreground" />
+                      <span>Open in new tab</span>
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem
+                    disabled={files.length === 0}
+                    onClick={() => {
+                      if (files.length === 0) return;
+                      const a = document.createElement("a");
+                      a.href = zipUrl(agentId, sessionId, projectId);
+                      a.rel = "noopener";
+                      a.click();
+                    }}
+                  >
+                    <Download className="h-4 w-4 text-muted-foreground" />
+                    <span>Download zip</span>
+                  </DropdownMenuItem>
+                  {deployMode === "self-hosted" && (
+                    <DropdownMenuItem
+                      disabled={revealing || (!sessionId && !projectId)}
+                      onClick={handleReveal}
+                    >
+                      <FolderSearch className="h-4 w-4 text-muted-foreground" />
+                      <span>Open in Finder</span>
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem disabled={loading} onClick={refresh}>
+                    <RefreshCw className="h-4 w-4 text-muted-foreground" />
+                    <span>Refresh</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <>
+                {appPreview.status === "running" && appPreview.previewUrl && (
+                  <a
+                    href={appPreview.previewUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                    title={`Open preview in new tab: ${appPreview.previewUrl}`}
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                  </a>
+                )}
+                <a
+                  href={files.length > 0 ? zipUrl(agentId, sessionId, projectId) : undefined}
+                  aria-disabled={files.length === 0}
+                  className={`rounded-md p-1.5 transition-colors ${
+                    files.length === 0
+                      ? "pointer-events-none text-muted-foreground/40"
+                      : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                  }`}
+                  title="Download all as zip"
+                >
+                  <Download className="h-4 w-4" />
+                </a>
+                {deployMode === "self-hosted" && (
+                  <button
+                    onClick={handleReveal}
+                    disabled={revealing || (!sessionId && !projectId)}
+                    className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+                    title="Open folder in Finder"
+                  >
+                    <FolderSearch className="h-4 w-4" />
+                  </button>
+                )}
+                <button
+                  onClick={refresh}
+                  disabled={loading}
+                  className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+                  title="Refresh"
+                >
+                  <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+                </button>
+              </>
             )}
             <button
-              onClick={refresh}
-              disabled={loading}
-              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors disabled:opacity-50"
-              title="Refresh"
-            >
-              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            </button>
-            <button
               onClick={onClose}
-              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
               title="Close"
             >
               <X className="h-4 w-4" />
             </button>
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-2">
-          {!loading && files.length === 0 ? (
-            <p className="px-3 py-8 text-center text-sm text-muted-foreground">
-              {projectId
-                ? "No files in this project yet."
-                : "No files in this session yet."}
-            </p>
-          ) : (
-            <div className="flex flex-col">
-              <div className="grid grid-cols-[1fr_auto_auto] gap-3 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70 border-b">
-                <span>Name</span>
-                <span>Modified</span>
-                <span>Size</span>
+        {tab === "code" ? (
+          <div className="flex flex-1 min-h-0 flex-col">
+            {/* When there's a template baseline, default to showing only the
+                files THIS task changed; let the user flip to the full tree. */}
+            {changed.available && (
+              <div className="flex items-center gap-1 border-b border-border px-3 py-1.5 text-xs">
+                <button
+                  onClick={() => setShowAll(false)}
+                  className={`rounded px-2 py-0.5 transition-colors ${
+                    !showAll ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  Changed{changed.files.length ? ` (${changed.files.length})` : ""}
+                </button>
+                <button
+                  onClick={() => setShowAll(true)}
+                  className={`rounded px-2 py-0.5 transition-colors ${
+                    showAll ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  All files
+                </button>
               </div>
-              {files.map((f) => {
-                const { icon: Icon } = fileKind(f.path);
-                const basename = f.path.split("/").pop() || f.path;
-                const downloadUrl = fileUrl(agentId, f.path, true);
+            )}
+            <div className="flex-1 overflow-y-auto p-2">
+              {(() => {
+                const showChanged = changed.available && !showAll;
+                const list = showChanged ? changed.files : files;
+                if (!loading && list.length === 0) {
+                  return (
+                    <p className="px-3 py-8 text-center text-sm text-muted-foreground">
+                      {showChanged
+                        ? "No changes yet — the agent hasn't edited any files."
+                        : projectId
+                          ? "No files in this project yet."
+                          : "No files in this session yet."}
+                    </p>
+                  );
+                }
                 return (
-                  <div
-                    key={f.path}
-                    className="group grid grid-cols-[1fr_auto_auto] items-center gap-3 px-3 py-2 hover:bg-muted/40 rounded-md transition-colors"
-                  >
-                    <button
-                      onClick={() => setPreviewing({ path: f.path, size: f.size })}
-                      className="flex items-center gap-2 min-w-0 text-left"
-                      title="Open preview"
-                    >
-                      <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
-                      <span className="text-sm text-foreground truncate">{basename}</span>
-                    </button>
-                    <span className="text-[11px] text-muted-foreground/70 whitespace-nowrap">
-                      {formatRelativeTime(f.modTime)}
-                    </span>
-                    <a
-                      href={downloadUrl}
-                      className="text-[11px] text-muted-foreground/70 whitespace-nowrap hover:text-foreground"
-                      title="Download"
-                    >
-                      {formatBytes(f.size)}
-                    </a>
-                  </div>
+                  <FileTreeView
+                    files={list}
+                    rootPrefix={projectId ? `projects/${projectId}/` : `sessions/${sessionId}/`}
+                    selectedPath={previewing?.path}
+                    onSelect={(f) => setPreviewing(f)}
+                  />
                 );
-              })}
+              })()}
             </div>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div className="flex-1 min-h-0">
+            {appPreview.status === "running" && appPreview.previewUrl ? (
+              <iframe
+                src={appPreview.previewUrl}
+                className="h-full w-full border-0 bg-white"
+                title="App preview"
+              />
+            ) : appPreview.status === "starting" || appPreview.status === "scaffolding" ? (
+              <div className="flex h-full flex-col">
+                <div className="flex items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground">
+                  <RefreshCw className="h-4 w-4 shrink-0 animate-spin" />
+                  <span>
+                    {appPreview.status === "scaffolding"
+                      ? "Installing dependencies — this can take a few minutes…"
+                      : "Starting the dev server…"}
+                  </span>
+                </div>
+                <div className="min-h-0 flex-1">
+                  <BuildLogView text={buildLogs} />
+                </div>
+              </div>
+            ) : appPreview.status === "crashed" ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+                <p className="text-sm text-destructive">Preview failed to start.</p>
+                <p className="text-xs text-muted-foreground">
+                  Ask the agent to check the dev-server logs (app_preview_logs).
+                </p>
+              </div>
+            ) : (
+              <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <Eye className="h-6 w-6" />
+                <p className="text-sm">No preview yet.</p>
+                <p className="text-xs">
+                  Ask the agent to build an app, and it shows up here.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
       </aside>
       {previewing && (
         <FilePreview
@@ -3320,8 +3712,14 @@ function FilePreview({ agentId, file, onClose }: { agentId: string; file: Produc
           {preview === "text" && (
             error ? <p className="text-sm text-destructive">Failed to load: {error}</p>
             : text === null ? <p className="text-sm text-muted-foreground">Loading…</p>
-            : (
+            : text.includes("```") ? (
+              // Content with its own fences would break the wrapper — fall back
+              // to a plain (unhighlighted) block.
               <pre className="text-xs font-mono whitespace-pre-wrap break-all bg-muted/30 rounded p-3">{text}</pre>
+            ) : (
+              // Reuse the chat markdown renderer's Shiki code plugin for
+              // highlighting by wrapping the file in a fenced block.
+              <ChatMarkdown text={"```" + langForPath(file.path) + "\n" + text + "\n```"} />
             )
           )}
           {preview === "html" && (
