@@ -182,7 +182,7 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 //
 // Empty default + partial indexes preserve existing query plans for
 // rows written before this column existed. Readers that want the
-// chatter should COALESCE(NULLIF(chatter_user_id,''), user_id) — the
+// chatter should COALESCE(NULLIF(chatter_user_id,”), user_id) — the
 // fallback is exactly right for the web channel (user_id was already
 // the chatter there) and matches the pre-fix behavior on IM (where
 // every chatter was mis-attributed to the channel owner anyway).
@@ -222,7 +222,7 @@ func (d *DBStore) migrateSessionsAddChatterUserID(ctx context.Context) error {
 }
 
 // migrateAgentGoalsAddRouting retrofits channel/account_id/chat_id/
-// project_id onto legacy agent_goals tables. All four default to ''
+// project_id onto legacy agent_goals tables. All four default to ”
 // — pre-existing rows had no continuation infrastructure attached
 // anyway, so the empty value just means "no routing recorded; can't
 // auto-continue this goal" and TryFireContinuation bails safely.
@@ -523,7 +523,7 @@ func (d *DBStore) migrateConfigsAddScopeColumn(ctx context.Context) error {
 // (user_id, agent_id) into a single lookup key: whichever is non-empty
 // wins (they're mutually exclusive for provider/setting rows — the only
 // kinds that remain in configs now that channels have their own table).
-// System rows get scope_id=''.
+// System rows get scope_id=”.
 //
 // Idempotent: skips the ALTER if the column already exists and only
 // backfills rows where scope_id is still empty.
@@ -2002,7 +2002,8 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM configs WHERE agent_id = %s", d.ph(1)), aid); err != nil {
+			fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+			aid, "%/"+aid); err != nil {
 			return err
 		}
 	}
@@ -2272,7 +2273,16 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, t := range []string{"agent_files", "sessions", "session_messages", "session_events", "cron_jobs"} {
+	for _, t := range []string{
+		"agent_files",
+		"sessions",
+		"session_messages",
+		"session_events",
+		"cron_jobs",
+		"projects",
+		"project_runtimes",
+		"agent_goals",
+	} {
 		if _, err := tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE agent_id = %s`, t, d.ph(1)), agentID); err != nil {
 			return err
@@ -2282,12 +2292,11 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		fmt.Sprintf(`DELETE FROM apikey_agents WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
 		return err
 	}
-	// Drop every config row pointing at this agent — owner's official
-	// rows (user_id='', agent_id=X), agent owner's per-agent overrides
-	// (user_id=owner, agent_id=X), and any non-owner per-agent
-	// overrides (user_id=other, agent_id=X).
+	// Drop every config row pointing at this agent — official agent rows
+	// (scope_id=X) and per-user agent overrides (scope_id=user/X).
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM configs WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
+		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s`, d.ph(1), d.ph(2)),
+		agentID, "%/"+agentID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -2818,7 +2827,7 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 //
 // Filter is strictly on chatter_user_id (no fallback to user_id). Old
 // rows written before the chatter_user_id column existed have it set
-// to '' and are not counted; those predate per-chatter resolution and
+// to ” and are not counted; those predate per-chatter resolution and
 // folding them in would over-count (they're keyed by channel owner,
 // not the actual chatter). New conversations write chatter_user_id
 // correctly so this is only a concern for sessions migrated from
@@ -3385,9 +3394,9 @@ func (d *DBStore) migrateChannelsFromConfigs(ctx context.Context) error {
 		// Each config row may have multiple accounts in its data JSON.
 		// Extract them and create one channel row per account.
 		var cc struct {
-			BotToken string                       `json:"botToken"`
-			BaseURL  string                       `json:"baseUrl"`
-			Accounts map[string]json.RawMessage   `json:"accounts"`
+			BotToken string                     `json:"botToken"`
+			BaseURL  string                     `json:"baseUrl"`
+			Accounts map[string]json.RawMessage `json:"accounts"`
 		}
 		if blob, merr := json.Marshal(cfg.Data); merr == nil {
 			_ = json.Unmarshal(blob, &cc)
