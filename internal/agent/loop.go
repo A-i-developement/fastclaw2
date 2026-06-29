@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2012,13 +2011,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
-	// Loop detection: track consecutive identical tool calls
-	type toolCallSig struct {
-		name string
-		hash [32]byte
-	}
-	var lastSig toolCallSig
-	consecutiveCount := 0
+	// Loop detection: track consecutive identical tool calls and results.
+	var loopDetector toolLoopDetector
 	totalToolCalls := 0
 	// allFailedRounds is the count of CONSECUTIVE rounds where every
 	// tool result came back as a 4xx/5xx HTTP error or an executor
@@ -2161,35 +2155,6 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
 
-		// Loop detection: check before executing
-		loopDetected := false
-		for _, tc := range resp.ToolCalls {
-			sig := toolCallSig{
-				name: tc.Function.Name,
-				hash: sha256.Sum256([]byte(tc.Function.Arguments)),
-			}
-			if sig.name == lastSig.name && sig.hash == lastSig.hash {
-				consecutiveCount++
-			} else {
-				consecutiveCount = 1
-				lastSig = sig
-			}
-			if consecutiveCount >= 3 {
-				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
-				warnMsg := provider.Message{
-					Role:    "system",
-					Content: "Loop detected: you called the same tool with the same arguments 3 times. Please try a different approach.",
-				}
-				sess.Append(warnMsg)
-				messages = append(messages, warnMsg)
-				loopDetected = true
-				break
-			}
-		}
-		if loopDetected {
-			break
-		}
-
 		// Fire BeforeToolCall hooks
 		for _, tc := range resp.ToolCalls {
 			a.hooks.Run(ctx, &HookContext{
@@ -2273,6 +2238,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			results = padded
 		}
 
+		loopDetected := false
 		// Round-level failure detection: did EVERY result come back
 		// as a 4xx/5xx HTTP error or executor error? Tracked here so
 		// the next iteration can decide whether to drop tools.
@@ -2353,6 +2319,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				evt["metadata"] = meta
 			}
 			emitEvent(ctx, ChatEvent{Type: "tool_result", Data: evt})
+
+			if loopDetector.Observe(tc, resultContent) && !loopDetected {
+				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
+				loopDetected = true
+			}
+		}
+		if loopDetected {
+			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
+			sess.Append(warnMsg)
+			messages = append(messages, warnMsg)
 		}
 		// Update consecutive-failed-rounds tally now that the whole
 		// round's results have been processed. A single non-failure
@@ -2362,6 +2338,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			allFailedRounds++
 		} else {
 			allFailedRounds = 0
+		}
+		if loopDetected {
+			break
 		}
 
 		// Steering: messages that arrived while this tool round ran are
@@ -2726,12 +2705,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
-	type toolCallSig struct {
-		name string
-		hash [32]byte
-	}
-	var lastSig toolCallSig
-	consecutiveCount := 0
+	var loopDetector toolLoopDetector
 	totalToolCalls := 0
 
 	// ReAct loop - use Chat for tool iterations
@@ -2850,35 +2824,6 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
 
-		// Loop detection
-		loopDetected := false
-		for _, tc := range resp.ToolCalls {
-			sig := toolCallSig{
-				name: tc.Function.Name,
-				hash: sha256.Sum256([]byte(tc.Function.Arguments)),
-			}
-			if sig.name == lastSig.name && sig.hash == lastSig.hash {
-				consecutiveCount++
-			} else {
-				consecutiveCount = 1
-				lastSig = sig
-			}
-			if consecutiveCount >= 3 {
-				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
-				warnMsg := provider.Message{
-					Role:    "system",
-					Content: "Loop detected: you called the same tool with the same arguments 3 times. Please try a different approach.",
-				}
-				sess.Append(warnMsg)
-				messages = append(messages, warnMsg)
-				loopDetected = true
-				break
-			}
-		}
-		if loopDetected {
-			break
-		}
-
 		// Fire BeforeToolCall hooks
 		for _, tc := range resp.ToolCalls {
 			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeToolCall, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID})
@@ -2887,6 +2832,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		// Execute tools concurrently via SDK engine
 		results := a.engine.executeToolsConcurrently(ctx, a.registry, resp.ToolCalls, a.workspacePath)
 		totalToolCalls += len(results)
+		loopDetected := false
 
 		for idx, r := range results {
 			tc := resp.ToolCalls[idx]
@@ -2904,6 +2850,19 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			toolMsg := provider.Message{Role: "tool", Content: resultContent, ToolCallID: tc.ID, Name: r.toolName, Metadata: meta}
 			sess.Append(toolMsg)
 			messages = append(messages, toolMsg)
+
+			if loopDetector.Observe(tc, resultContent) && !loopDetected {
+				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
+				loopDetected = true
+			}
+		}
+		if loopDetected {
+			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
+			sess.Append(warnMsg)
+			messages = append(messages, warnMsg)
+		}
+		if loopDetected {
+			break
 		}
 	}
 
