@@ -1822,6 +1822,173 @@ func llmRetry(ctx context.Context, label string, fn func(context.Context) (*prov
 	return nil, lastErr
 }
 
+// sameToolFailStreakLimit and softDeadlineFraction gate the two stall-
+// prevention mechanisms added per fastclaw-timeout-error-root-cause-
+// analysis.md (P0.1 / P1). sameToolFailStreakLimit is intentionally
+// tighter than the pre-existing allFailedRounds/failedRoundsLimit (3):
+// "the same tool failed twice in a row, even with different arguments"
+// is a stronger unproductive-loop signal than "some tool in the round
+// failed", and should trip sooner. softDeadlineFraction leaves ~20% of
+// the turn's wall-time budget as headroom for one more full LLM
+// round-trip + response after the wrap-up nudge fires.
+const sameToolFailStreakLimit = 2
+const softDeadlineFraction = 0.20
+
+// toolProgressInterval is how often runToolsWithProgress emits a
+// "tool_progress" heartbeat while a tool-execution round is in flight.
+const toolProgressInterval = 8 * time.Second
+
+// sameToolFailStreakState is the running state for the P0.1 same-tool-
+// repeated-failure detector, threaded through updateSameToolFailStreak
+// across a turn's tool-result processing. Extracted into a small pure
+// struct + function (rather than three loose local vars mutated inline
+// in both HandleMessage and HandleMessageStream) specifically so the
+// counting/reset rules have one implementation and can be unit-tested
+// directly — see TestUpdateSameToolFailStreak in loop_stall_test.go.
+// Building a full fake-Provider/Agent harness to exercise this inline
+// would have required far more scaffolding than the pure-function
+// extraction costs.
+type sameToolFailStreakState struct {
+	streak          int
+	lastFailedTool  string
+	lastFailureText string
+}
+
+// updateSameToolFailStreak folds one tool-result's outcome into the
+// running streak and returns the updated state. failed should come
+// from isFailedToolResult; summary is the one-line failure description
+// to remember for buildFallbackReply (ignored when failed is false).
+//
+// Rules:
+//   - Same tool, still failing: streak increments.
+//   - A different tool starts failing: streak resets to 1, the
+//     tracked tool switches to this one.
+//   - The tool whose streak we're tracking now succeeds: streak resets
+//     to 0, tracked tool cleared.
+//   - Some other (not currently tracked) tool succeeds: no change —
+//     this call doesn't concern the tool we're tracking.
+func updateSameToolFailStreak(state sameToolFailStreakState, toolName string, failed bool, summary string) sameToolFailStreakState {
+	if failed {
+		if toolName == state.lastFailedTool {
+			state.streak++
+		} else {
+			state.streak = 1
+			state.lastFailedTool = toolName
+		}
+		state.lastFailureText = summary
+		return state
+	}
+	if toolName == state.lastFailedTool {
+		state.streak = 0
+		state.lastFailedTool = ""
+	}
+	return state
+}
+
+// buildFallbackReply assembles a context-aware message when a turn is
+// cut short by an error, instead of the old static string that
+// discarded every diagnostic clue the agent had already gathered.
+// Modeled on the pattern already used in subagent.go's DeadlineExceeded
+// handling (see runSubagentLoop) — that path already surfaces "ran out
+// of its N-minute wall-time budget" instead of a canned string; this
+// brings loop.go's two top-level paths (HandleMessage,
+// HandleMessageStream) up to the same standard.
+//
+// replyParts may be nil/empty (HandleMessageStream doesn't accumulate
+// reply text the way HandleMessage does) — handled gracefully.
+func buildFallbackReply(err error, replyParts []string, lastToolName, lastToolFailure string) string {
+	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	var sb strings.Builder
+	if len(replyParts) > 0 {
+		sb.WriteString(joinReplyParts(replyParts))
+		sb.WriteString("\n\n")
+	}
+	switch {
+	case timedOut && lastToolName != "":
+		fmt.Fprintf(&sb, "I ran out of time while working on this — I was last troubleshooting %q, which was failing with: %s. Want me to keep going, or would you like to address that first?",
+			lastToolName, firstNonEmptyLine(lastToolFailure))
+	case timedOut:
+		sb.WriteString("I ran out of time before finishing this. Want me to try again, possibly with a narrower scope?")
+	default:
+		fmt.Fprintf(&sb, "Sorry, I hit an error while processing this: %s", err.Error())
+	}
+	return sb.String()
+}
+
+// maybeInjectSoftDeadlineWarning checks ctx's deadline (if any) against
+// the turn's start time. When less than softDeadlineFraction of the
+// total budget remains and this hasn't fired yet this turn, it appends
+// a system message asking the model to stop exploring and deliver its
+// best answer now, emits a "status" event (phase="wrap_up") so callers
+// can surface it, and returns fired=true so the caller can gate this to
+// fire exactly once per turn.
+//
+// No-ops (returns messages unchanged, fired=false) when ctx has no
+// deadline — some callers (tests, certain cron paths) don't set one.
+func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, messages []provider.Message, alreadyFired bool) ([]provider.Message, bool) {
+	if alreadyFired {
+		return messages, true
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return messages, false
+	}
+	total := deadline.Sub(turnStart)
+	if total <= 0 {
+		return messages, false
+	}
+	remaining := time.Until(deadline)
+	if float64(remaining) > float64(total)*softDeadlineFraction {
+		return messages, false
+	}
+	emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+		"phase":             "wrap_up",
+		"remaining_seconds": remaining.Seconds(),
+	}})
+	warnMsg := provider.Message{
+		Role: "system",
+		Content: fmt.Sprintf(
+			"Time budget warning: roughly %.0fs remain before this turn is forcibly cut off. "+
+				"Stop starting new tool calls. Summarize what you've found so far and give your "+
+				"best-effort answer now.",
+			remaining.Seconds()),
+	}
+	return append(messages, warnMsg), true
+}
+
+// runToolsWithProgress wraps executeToolsConcurrently with a ticker that
+// emits "tool_progress" events every toolProgressInterval while the
+// call is in flight, so a slow tool (sandbox exec, subagent delegate)
+// doesn't look frozen between the tool_call and tool_result events.
+// Stops cleanly via a done channel the instant the blocking call
+// returns — no goroutine leak, no event fired after the fact.
+func (a *Agent) runToolsWithProgress(ctx context.Context, toolCalls []provider.ToolCall, workspace string) []toolCallResult {
+	toolNames := make([]string, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		toolNames = append(toolNames, tc.Function.Name)
+	}
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		ticker := time.NewTicker(toolProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				emitEvent(ctx, ChatEvent{Type: "tool_progress", Data: map[string]any{
+					"tools":           toolNames,
+					"elapsed_seconds": time.Since(start).Seconds(),
+				}})
+			}
+		}
+	}()
+	results := a.engine.executeToolsConcurrently(ctx, a.registry, toolCalls, workspace)
+	close(done)
+	return results
+}
+
 // HandleMessage processes an inbound message through the ReAct loop.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
 	// Check for slash commands first. Empty reply means "handled but
@@ -2031,6 +2198,24 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// directly instead of burning more rounds chasing dead URLs.
 	allFailedRounds := 0
 	const failedRoundsLimit = 3
+	// sameToolFailStreak / lastFailedToolName track "the same tool
+	// failed N times in a row, regardless of arguments" — a tighter,
+	// argument-agnostic sibling of allFailedRounds. See
+	// fastclaw-timeout-error-root-cause-analysis.md P0.1: this catches
+	// e.g. two differently-worded "browser-use --doctor" retries that
+	// both fail, one round sooner than allFailedRounds' threshold of 3
+	// would, before the turn's wall-clock budget runs out.
+	//
+	// streakState is a sameToolFailStreakState (see updateSameToolFailStreak)
+	// rather than loose vars specifically so the counting/reset rules
+	// are unit-tested independently of this function.
+	streakState := sameToolFailStreakState{}
+	// turnStart / softDeadlineFired back the soft-deadline heartbeat
+	// (P1): once ctx's deadline is within softDeadlineFraction of
+	// arriving, inject a one-time wrap-up nudge instead of letting the
+	// turn run until it's hard-killed mid-request.
+	turnStart := time.Now()
+	softDeadlineFired := false
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2049,6 +2234,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			"channel", msg.Channel,
 			"chat_id", msg.ChatID,
 		)
+
+		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
 
 		// Hook: BeforeModelCall
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
@@ -2072,8 +2259,23 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// forced to produce a text answer with what it has. The
 		// system message above the request makes the constraint
 		// explicit so the model doesn't apologetically dangle.
+		//
+		// sameToolFailStreak is checked first (tighter threshold, more
+		// specific signal) so the two nudges don't both fire the same
+		// round.
 		callTools := toolDefs
-		if allFailedRounds >= failedRoundsLimit {
+		if streakState.streak >= sameToolFailStreakLimit {
+			slog.Warn("same tool failed repeatedly — forcing convergence",
+				"agent", a.name, "tool", streakState.lastFailedTool, "streak", streakState.streak)
+			callTools = nil
+			llmMessages = append(llmMessages, provider.Message{
+				Role: "system",
+				Content: fmt.Sprintf(
+					"The tool %q has failed %d times in a row (even with different arguments). Stop retrying it. Either explain to the user what's blocking it, or answer with what you already know.",
+					streakState.lastFailedTool, streakState.streak,
+				),
+			})
+		} else if allFailedRounds >= failedRoundsLimit {
 			slog.Warn("disabling tools after consecutive failed rounds",
 				"agent", a.name, "failed_rounds", allFailedRounds)
 			callTools = nil
@@ -2096,9 +2298,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 		if err != nil {
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
+			fallback := buildFallbackReply(err, replyParts, streakState.lastFailedTool, streakState.lastFailureText)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
-			return "Sorry, I encountered an error processing your request."
+			return fallback
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
@@ -2234,7 +2437,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			"agent", a.name,
 			"count", len(executeCalls),
 		)
-		results := a.engine.executeToolsConcurrently(ctx, a.registry, executeCalls, a.workspacePath)
+		results := a.runToolsWithProgress(ctx, executeCalls, a.workspacePath)
 		// Append synthetic deferred results so every original tool_use
 		// id has a paired tool_result. The deferred message tells the
 		// model exactly why it didn't run — it can re-issue next
@@ -2321,10 +2524,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 					summary = firstNonEmptyLine(resultContent)
 				}
 				a.registry.RecordToolFailure(r.toolName, tc.Function.Arguments, summary)
+				// Same-tool-fail-streak tracking (P0.1): counts
+				// consecutive failures of THIS tool regardless of
+				// arguments, independent of roundAllFailed (which
+				// requires the whole round to fail). See
+				// updateSameToolFailStreak for the tested counting rules.
+				streakState = updateSameToolFailStreak(streakState, r.toolName, true, summary)
 			} else {
 				// One call in this round produced a real result —
 				// the round as a whole isn't "all failed".
 				roundAllFailed = false
+				streakState = updateSameToolFailStreak(streakState, r.toolName, false, "")
 			}
 
 			// Index in FTS if available
@@ -2737,15 +2947,43 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	var lastSig toolCallSig
 	consecutiveCount := 0
 	totalToolCalls := 0
+	// sameToolFailStreak / lastFailedToolName / lastToolFailureSummary
+	// and turnStart / softDeadlineFired mirror the same additions in
+	// HandleMessage — see fastclaw-timeout-error-root-cause-analysis.md
+	// P0.1 / P1. HandleMessageStream previously had no failure
+	// classification at all in its tool-result loop; isFailedToolResult
+	// (already used by HandleMessage) is reused here for parity.
+	streakState := sameToolFailStreakState{}
+	turnStart := time.Now()
+	softDeadlineFired := false
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
+		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
+
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
 
-		dumpLLMRequest(a.name, a.model, messages, toolDefs)
+		// callTools mirrors HandleMessage's disable-tools-after-
+		// repeated-failure gate (P0.1). sameToolFailStreakLimit is
+		// checked first (tighter threshold, more specific signal).
+		callTools := toolDefs
+		if streakState.streak >= sameToolFailStreakLimit {
+			slog.Warn("same tool failed repeatedly — forcing convergence",
+				"agent", a.name, "tool", streakState.lastFailedTool, "streak", streakState.streak)
+			callTools = nil
+			messages = append(messages, provider.Message{
+				Role: "system",
+				Content: fmt.Sprintf(
+					"The tool %q has failed %d times in a row (even with different arguments). Stop retrying it. Either explain to the user what's blocking it, or answer with what you already know.",
+					streakState.lastFailedTool, streakState.streak,
+				),
+			})
+		}
+
+		dumpLLMRequest(a.name, a.model, messages, callTools)
 		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+			return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
 		})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -2753,7 +2991,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		if err != nil {
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
-			return a.stringStream("Sorry, I encountered an error processing your request.")
+			return a.stringStream(buildFallbackReply(err, nil, streakState.lastFailedTool, streakState.lastFailureText))
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
@@ -2891,7 +3129,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		}
 
 		// Execute tools concurrently via SDK engine
-		results := a.engine.executeToolsConcurrently(ctx, a.registry, resp.ToolCalls, a.workspacePath)
+		results := a.runToolsWithProgress(ctx, resp.ToolCalls, a.workspacePath)
 		totalToolCalls += len(results)
 
 		for idx, r := range results {
@@ -2901,6 +3139,23 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 			if r.err != nil {
 				slog.Warn("tool execution error", "agent", a.name, "name", r.toolName, "error", r.err)
+			}
+
+			// Same-tool-fail-streak tracking (P0.1) — this function had
+			// no failure classification at all before; isFailedToolResult
+			// is the same helper HandleMessage already uses. See
+			// updateSameToolFailStreak for the tested counting rules.
+			if isFailedToolResult(r.err, resultContent) {
+				summary := ""
+				if r.err != nil {
+					summary = r.err.Error()
+				}
+				if summary == "" || summary == "<nil>" {
+					summary = firstNonEmptyLine(resultContent)
+				}
+				streakState = updateSameToolFailStreak(streakState, r.toolName, true, summary)
+			} else {
+				streakState = updateSameToolFailStreak(streakState, r.toolName, false, "")
 			}
 
 			if mediaPaths := extractMediaPaths(resultContent); len(mediaPaths) > 0 {
