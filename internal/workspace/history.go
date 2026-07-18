@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,16 +30,29 @@ import (
 //   - Everything is best-effort: history failures must never fail or block
 //     an agent run. Callers log and move on.
 //
+// Known limitation: there is no retention policy — every dirty turn adds a
+// commit, so binary-heavy workspaces grow the repo unbounded. A git gc /
+// retention window is future work.
+//
 // Rollback is manual for now (git --git-dir=<repo> --work-tree=<dir> log /
 // checkout); a workspace-panel entry can come later.
 type History struct {
 	root string
+	// locks serializes commits per scope: two overlapping turns of the same
+	// chat must never race the same repo's index (loser hits index.lock and
+	// silently loses a snapshot).
+	locks sync.Map // scope -> *sync.Mutex
 }
 
 // NewHistory returns a History storing bare repositories under root
 // (one <scope>.git per workspace scope).
 func NewHistory(root string) *History {
 	return &History{root: root}
+}
+
+func (h *History) lockFor(scope string) *sync.Mutex {
+	lock, _ := h.locks.LoadOrStore(scope, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 // Commit snapshots workTree into the scope's bare repository. The first
@@ -52,7 +66,11 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 	if err != nil || !info.IsDir() {
 		return nil // nothing to snapshot
 	}
-	repo := filepath.Join(h.root, scope+".git")
+	lock := h.lockFor(scope)
+	lock.Lock()
+	defer lock.Unlock()
+
+	repo := h.RepoPath(scope)
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
 			return err
@@ -60,16 +78,16 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 		// NOTE: git rejects init combined with --work-tree
 		// ("GIT_WORK_TREE not allowed without GIT_DIR"), so init uses the
 		// plain path form and only later commands carry --git-dir/--work-tree.
-		if out, err := runGit(ctx, nil, "init", "--bare", repo); err != nil {
+		if out, err := runGit(ctx, "init", "--bare", repo); err != nil {
 			return fmt.Errorf("git init: %s: %w", out, err)
 		}
 	}
 	gitDir := "--git-dir=" + repo
 	workTreeArg := "--work-tree=" + workTree
-	if out, err := runGit(ctx, nil, gitDir, workTreeArg, "add", "-A"); err != nil {
+	if out, err := runGit(ctx, gitDir, workTreeArg, "add", "-A"); err != nil {
 		return fmt.Errorf("git add: %s: %w", out, err)
 	}
-	status, err := runGit(ctx, nil, gitDir, workTreeArg, "status", "--porcelain")
+	status, err := runGit(ctx, gitDir, workTreeArg, "status", "--porcelain")
 	if err != nil {
 		return fmt.Errorf("git status: %s: %w", status, err)
 	}
@@ -77,7 +95,7 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 		return nil // clean tree — skip empty commit
 	}
 	// Inline identity so this works without the operator's global git config.
-	out, err := runGit(ctx, nil, gitDir, workTreeArg,
+	out, err := runGit(ctx, gitDir, workTreeArg,
 		"-c", "user.name=fastclaw", "-c", "user.email=fastclaw@localhost",
 		"commit", "-m", message, "--quiet")
 	if err != nil {
@@ -101,7 +119,7 @@ func (h *History) List(ctx context.Context, scope string) ([]Entry, error) {
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
 		return nil, nil
 	}
-	out, err := runGit(ctx, nil, "--git-dir="+repo, "log", "--pretty=%H|%s|%ct")
+	out, err := runGit(ctx, "--git-dir="+repo, "log", "--pretty=%H|%s|%ct")
 	if err != nil {
 		return nil, fmt.Errorf("git log: %s: %w", out, err)
 	}
@@ -132,7 +150,7 @@ func (h *History) Restore(ctx context.Context, scope, workTree, commit string) e
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
 		return fmt.Errorf("workspace history: no history for scope %q", scope)
 	}
-	out, err := runGit(ctx, nil, "--git-dir="+repo, "--work-tree="+workTree, "checkout", commit, "--", ".")
+	out, err := runGit(ctx, "--git-dir="+repo, "--work-tree="+workTree, "checkout", commit, "--", ".")
 	if err != nil {
 		return fmt.Errorf("git checkout: %s: %w", out, err)
 	}
@@ -153,20 +171,35 @@ func isHexHash(s string) bool {
 }
 
 // RepoPath returns the bare repository path for a scope (used by tests and
-// by any future rollback UI).
+// by any future rollback UI). The scope is allowlist-sanitized — it is
+// built from operator/channel-provided ids and lands in a file path.
 func (h *History) RepoPath(scope string) string {
-	return filepath.Join(h.root, scope+".git")
+	return filepath.Join(h.root, sanitizeScope(scope)+".git")
+}
+
+// sanitizeScope maps anything outside [A-Za-z0-9._-] to '_', so a hostile
+// or unusual chat/project id can't escape the history root.
+func sanitizeScope(scope string) string {
+	var b strings.Builder
+	b.Grow(len(scope))
+	for _, c := range scope {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // runGit executes a git command with a hard timeout and returns combined
-// output. env is reserved for callers that need to override the environment.
-func runGit(ctx context.Context, env []string, args ...string) (string, error) {
+// output.
+func runGit(ctx context.Context, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
-	if env != nil {
-		cmd.Env = env
-	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

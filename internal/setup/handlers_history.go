@@ -19,10 +19,11 @@ import (
 
 // workspaceHistoryScope resolves the URL sessionId to the history scope key
 // and the on-disk worktree. Only LocalFS-backed workspaces have on-disk
-// scope dirs, so S3 deployments get a stable 503 (never a 404 that looks
+// scope dirs (probed via the LocalScoper marker, so a Metered wrapper still
+// counts), so S3 deployments get a stable 503 (never a 404 that looks
 // like "no history yet").
 func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, agentID, urlToken string) (scope, workTree string, ok bool) {
-	fs, isLocal := s.workspaceStore.(*workspace.LocalFS)
+	ls, isLocal := s.workspaceStore.(workspace.LocalScoper)
 	if !isLocal {
 		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a local workspace store"})
 		return "", "", false
@@ -37,7 +38,8 @@ func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, a
 	if projectID != "" {
 		scope = projectID + "-" + chatID
 	}
-	return scope, fs.ScopeDir(agentID, projectID, chatID), true
+	workTree, _ = ls.LocalScopeDir(agentID, projectID, chatID)
+	return scope, workTree, true
 }
 
 func (s *Server) workspaceHistoryRoot() (string, error) {

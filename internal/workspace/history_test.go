@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,7 +46,7 @@ func TestHistoryCommitSnapshotsWorkTree(t *testing.T) {
 	if info, err := os.Stat(repo); err != nil || !info.IsDir() {
 		t.Fatalf("bare repo should exist at %s", repo)
 	}
-	// 工作区内不得出现 .git（agent 可见性红线）
+	// the agent must never see its own history: no .git inside the worktree
 	if _, err := os.Stat(filepath.Join(workTree, ".git")); !os.IsNotExist(err) {
 		t.Fatal("workTree must not contain .git")
 	}
@@ -73,8 +74,12 @@ func TestHistorySkipsEmptyCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if log := gitLog(t, h.RepoPath("s1"), workTree); strings.Count(log, "\n") != 0 && len(strings.Split(strings.TrimSpace(log), "\n")) != 1 {
-		t.Fatalf("clean tree must not produce an empty commit: %s", log)
+	out, err := exec.Command("git", "--git-dir="+h.RepoPath("s1"), "rev-list", "--count", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-list: %v: %s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("clean tree must not produce an empty commit, got %s commits", out)
 	}
 }
 
@@ -105,7 +110,7 @@ func TestHistorySecondCommitCapturesModificationAndRollback(t *testing.T) {
 	if log := gitLog(t, repo, workTree); len(strings.Split(strings.TrimSpace(log), "\n")) != 2 {
 		t.Fatalf("expected 2 commits: %s", log)
 	}
-	// 回滚到 run-1 的内容
+	// roll back to the run-1 content
 	out, err := exec.Command("git", "--git-dir="+repo, "--work-tree="+workTree, "checkout", "HEAD~1", "--", "a.txt").CombinedOutput()
 	if err != nil {
 		t.Fatalf("checkout: %v: %s", err, out)
@@ -175,5 +180,44 @@ func TestHistoryRestoreRejectsBadHash(t *testing.T) {
 	h := NewHistory(t.TempDir())
 	if err := h.Restore(context.Background(), "s1", t.TempDir(), "main; rm -rf /"); err == nil {
 		t.Fatal("invalid hash must be rejected")
+	}
+}
+
+func TestHistoryConcurrentCommitsAreSerialized(t *testing.T) {
+	gitAvailable(t)
+	root := t.TempDir()
+	workTree := filepath.Join(root, "ws")
+	if err := os.MkdirAll(workTree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHistory(filepath.Join(root, "history"))
+	ctx := context.Background()
+
+	// Hammer the same scope from many goroutines. Without the per-scope
+	// lock some of these would fail on index.lock; with it, every commit
+	// must succeed (each may legitimately skip as a clean tree).
+	const n = 8
+	done := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			name := fmt.Sprintf("f%d.txt", i)
+			if err := os.WriteFile(filepath.Join(workTree, name), []byte(fmt.Sprintf("v%d", i)), 0o644); err != nil {
+				done <- err
+				return
+			}
+			done <- h.Commit(ctx, "s1", workTree, "turn "+name)
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("concurrent commit must not fail on index race: %v", err)
+		}
+	}
+	out, err := exec.Command("git", "--git-dir="+h.RepoPath("s1"), "rev-list", "--count", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-list: %v: %s", err, out)
+	}
+	if strings.TrimSpace(string(out)) == "0" {
+		t.Fatal("at least one commit must land")
 	}
 }

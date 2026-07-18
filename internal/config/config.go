@@ -246,8 +246,9 @@ type RateLimitCfg struct {
 }
 
 // WorkspaceHistoryCfg toggles the opt-in per-session workspace version
-// history (git snapshots committed at turn boundary). Localfs-backed
-// workspaces only — S3-backed stores skip history entirely.
+// history (git snapshots committed at turn boundary). LocalFS-backed
+// workspaces only — S3-backed stores skip history entirely. Known
+// limitation: no retention policy yet — every dirty turn adds a commit.
 type WorkspaceHistoryCfg struct {
 	Enabled bool `json:"enabled"`
 }

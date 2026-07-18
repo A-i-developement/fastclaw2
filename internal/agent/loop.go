@@ -2637,14 +2637,18 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	// mount are invisible to this process; the turn boundary is the one
 	// consistency point that covers file tools, exec and uploads.
 	if a.workspaceHistoryEnabled && a.history != nil {
-		if fs, ok := a.workspaceStore.(*workspace.LocalFS); ok {
+		if ls, ok := a.workspaceStore.(workspace.LocalScoper); ok {
 			scope := msg.ChatID
 			if pid := a.registry.ProjectID(); pid != "" {
 				scope = pid + "-" + msg.ChatID
 			}
-			workTree := fs.ScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
+			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
 			go func() {
-				if err := a.history.Commit(ctx, scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
+				// context.Background(): the turn ctx is cancelled when the HTTP
+				// handler returns, and a killed git leaves index.lock behind,
+				// silently breaking every later snapshot of this scope.
+				// runGit has its own 30s timeout as the bound.
+				if err := a.history.Commit(context.Background(), scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
 					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
 				}
 			}()
