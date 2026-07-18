@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -69,6 +70,8 @@ type Agent struct {
 	ftsStore        *store.FTSStore
 	piiScrubEnabled bool
 	memoryCfg       config.MemoryCfg
+	workspaceHistoryEnabled bool
+	history                 *workspace.History
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
 	// per-turn system-prompt hint that advertises SplitMessageMarker
 	// to the LLM (see renderChannelHints) AND stamps
@@ -221,6 +224,10 @@ func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBu
 func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string, fullCfg *config.Config) *Agent {
 	ag := NewAgentWithSkillsCfg(rc, prov, mb, homeDir, fullCfg.Skills)
 	ag.memoryCfg = fullCfg.Memory
+	ag.workspaceHistoryEnabled = fullCfg.WorkspaceHistory.Enabled
+	if ag.workspaceHistoryEnabled {
+		ag.history = workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
+	}
 	ag.piiScrubEnabled = fullCfg.Privacy.PIIScrubbing.Enabled
 	// splitReplies is plumbed inside NewAgentWithSkillsCfg so foreign-
 	// attached agents also pick up the toggle; don't re-stamp here.
@@ -2622,6 +2629,26 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 				slog.Debug("skills learner error", "error", err)
 			}
 		}()
+	}
+
+	// Workspace version history: snapshot the session workspace at turn
+	// boundary (opt-in; LocalFS only — S3-backed stores skip). Commit
+	// here, not per tool write, because sandbox exec writes via the bind
+	// mount are invisible to this process; the turn boundary is the one
+	// consistency point that covers file tools, exec and uploads.
+	if a.workspaceHistoryEnabled && a.history != nil {
+		if fs, ok := a.workspaceStore.(*workspace.LocalFS); ok {
+			scope := msg.ChatID
+			if pid := a.registry.ProjectID(); pid != "" {
+				scope = pid + "-" + msg.ChatID
+			}
+			workTree := fs.ScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
+			go func() {
+				if err := a.history.Commit(ctx, scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
+					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
+				}
+			}()
+		}
 	}
 }
 

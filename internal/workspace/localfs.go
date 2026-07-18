@@ -60,6 +60,13 @@ func (f *LocalFS) LocalScopeDir(agentID, projectID, sessionID string) (string, b
 // at `/workspace/<other-sid>/...`) but cwd into the chat's subdir
 // so relative writes default to the chat's own files — see
 // docker_executor.go's pool.Get.
+// ScopeDir returns the on-disk directory for one (agent, project, session)
+// scope. Exported for workspace history snapshots (a LocalFS-only feature);
+// prefer scopeDir for internal use.
+func (f *LocalFS) ScopeDir(agentID, projectID, sessionID string) string {
+	return f.scopeDir(agentID, projectID, sessionID)
+}
+
 func (f *LocalFS) scopeDir(agentID, projectID, sessionID string) string {
 	switch {
 	case projectID != "" && sessionID != "":

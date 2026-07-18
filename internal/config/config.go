@@ -245,6 +245,13 @@ type RateLimitCfg struct {
 	RPM int `json:"rpm,omitempty"`
 }
 
+// WorkspaceHistoryCfg toggles the opt-in per-session workspace version
+// history (git snapshots committed at turn boundary). Localfs-backed
+// workspaces only — S3-backed stores skip history entirely.
+type WorkspaceHistoryCfg struct {
+	Enabled bool `json:"enabled"`
+}
+
 type MemoryCfg struct {
 	AutoPersist AutoPersistCfg `json:"autoPersist,omitempty"`
 	FTS         FTSCfg         `json:"fts,omitempty"`
@@ -299,6 +306,7 @@ type Config struct {
 	TaskQueue     TaskQueueCfg               `json:"taskQueue,omitempty"`
 	Skills        SkillsCfg                  `json:"skills,omitempty"`
 	Memory        MemoryCfg                  `json:"memory,omitempty"`
+	WorkspaceHistory WorkspaceHistoryCfg    `json:"workspaceHistory,omitempty"`
 	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
 	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
 	Prefs         PrefsCfg                   `json:"prefs,omitempty"`
