@@ -215,6 +215,13 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	a.registry.SetExecutor(ex)
 }
 
+// newWorkspaceHistory builds the git-snapshot history store rooted under
+// FASTCLAW_HOME. Package-level helper so call sites where a local
+// `workspace` string shadows the workspace package can use it.
+func newWorkspaceHistory(homeDir string) *workspace.History {
+	return workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
+}
+
 // NewAgent creates a new Agent from a resolved config.
 func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string) *Agent {
 	return NewAgentWithSkillsCfg(rc, prov, mb, homeDir, config.SkillsCfg{})
@@ -226,7 +233,7 @@ func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bu
 	ag.memoryCfg = fullCfg.Memory
 	ag.workspaceHistoryEnabled = fullCfg.WorkspaceHistory.Enabled
 	if ag.workspaceHistoryEnabled {
-		ag.history = workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
+		ag.history = newWorkspaceHistory(homeDir)
 	}
 	ag.piiScrubEnabled = fullCfg.Privacy.PIIScrubbing.Enabled
 	// splitReplies is plumbed inside NewAgentWithSkillsCfg so foreign-
@@ -388,6 +395,15 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// AutoPersist without specifying a cadence.
 	if rc.AutoPersist != nil {
 		ag.memoryCfg.AutoPersist.Enabled = *rc.AutoPersist
+	}
+	// Workspace history toggle — same per-agent pointer pattern as
+	// AutoPersist above (NewAgentWithSkillsCfg is the production path;
+	// the fullCfg copy in NewAgentWithFullCfg covers the system default).
+	if rc.WorkspaceHistory != nil {
+		ag.workspaceHistoryEnabled = *rc.WorkspaceHistory
+	}
+	if ag.workspaceHistoryEnabled && ag.history == nil {
+		ag.history = newWorkspaceHistory(homeDir)
 	}
 	if ag.memoryCfg.AutoPersist.EveryNTurns == 0 {
 		ag.memoryCfg.AutoPersist.EveryNTurns = 5

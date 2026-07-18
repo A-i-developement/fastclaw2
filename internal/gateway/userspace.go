@@ -273,6 +273,9 @@ func assembleConfig(ctx context.Context, st store.Store, userID, agentID string)
 	if err := scope.SettingInto(ctx, st, NSMemory, userID, agentID, &cfg.Memory); err != nil {
 		return nil, err
 	}
+	if err := scope.SettingInto(ctx, st, NSWorkspaceHistory, userID, agentID, &cfg.WorkspaceHistory); err != nil {
+		return nil, err
+	}
 	if err := scope.SettingInto(ctx, st, NSPrivacy, userID, agentID, &cfg.Privacy); err != nil {
 		return nil, err
 	}
@@ -733,6 +736,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 			if agentOverride.AutoPersist != nil {
 				v := *agentOverride.AutoPersist
 				rc.AutoPersist = &v
+			}
+			if agentOverride.WorkspaceHistory != nil {
+				v := *agentOverride.WorkspaceHistory
+				rc.WorkspaceHistory = &v
 			}
 		}
 		// Same story for providers: assembleConfig was called with
