@@ -118,3 +118,62 @@ func TestHistorySecondCommitCapturesModificationAndRollback(t *testing.T) {
 		t.Fatalf("rollback should restore v1, got %q", data)
 	}
 }
+
+func TestHistoryListAndRestore(t *testing.T) {
+	gitAvailable(t)
+	root := t.TempDir()
+	workTree := filepath.Join(root, "ws")
+	if err := os.MkdirAll(workTree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(workTree, "a.txt")
+	h := NewHistory(filepath.Join(root, "history"))
+	ctx := context.Background()
+
+	if err := os.WriteFile(file, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Commit(ctx, "s1", workTree, "turn 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Commit(ctx, "s1", workTree, "turn 2"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := h.List(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].Message != "turn 2" || entries[0].Time == 0 {
+		t.Fatalf("newest entry first with timestamp: %+v", entries[0])
+	}
+	// 无历史的 scope 返回空列表而非错误
+	if empty, err := h.List(ctx, "nope"); err != nil || len(empty) != 0 {
+		t.Fatalf("missing scope should list empty: %v %v", empty, err)
+	}
+
+	if err := h.Restore(ctx, "s1", workTree, entries[1].Hash); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "v1" {
+		t.Fatalf("restore should bring back v1, got %q", data)
+	}
+}
+
+func TestHistoryRestoreRejectsBadHash(t *testing.T) {
+	gitAvailable(t)
+	h := NewHistory(t.TempDir())
+	if err := h.Restore(context.Background(), "s1", t.TempDir(), "main; rm -rf /"); err == nil {
+		t.Fatal("invalid hash must be rejected")
+	}
+}

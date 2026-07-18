@@ -87,6 +87,71 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 	return nil
 }
 
+// Entry is one snapshot commit, newest first when returned by List.
+type Entry struct {
+	Hash    string `json:"hash"`
+	Message string `json:"message"`
+	Time    int64  `json:"time"`
+}
+
+// List returns the scope's snapshot commits, newest first. No history
+// yields an empty slice (not an error).
+func (h *History) List(ctx context.Context, scope string) ([]Entry, error) {
+	repo := h.RepoPath(scope)
+	if _, err := os.Stat(repo); os.IsNotExist(err) {
+		return nil, nil
+	}
+	out, err := runGit(ctx, nil, "--git-dir="+repo, "log", "--pretty=%H|%s|%ct")
+	if err != nil {
+		return nil, fmt.Errorf("git log: %s: %w", out, err)
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	var entries []Entry
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		var t int64
+		fmt.Sscanf(parts[2], "%d", &t)
+		entries = append(entries, Entry{Hash: parts[0], Message: parts[1], Time: t})
+	}
+	return entries, nil
+}
+
+// Restore checks the whole worktree out to the given commit. The commit
+// hash is validated to prevent flag injection.
+func (h *History) Restore(ctx context.Context, scope, workTree, commit string) error {
+	if !isHexHash(commit) {
+		return fmt.Errorf("workspace history: invalid commit hash")
+	}
+	repo := h.RepoPath(scope)
+	if _, err := os.Stat(repo); os.IsNotExist(err) {
+		return fmt.Errorf("workspace history: no history for scope %q", scope)
+	}
+	out, err := runGit(ctx, nil, "--git-dir="+repo, "--work-tree="+workTree, "checkout", commit, "--", ".")
+	if err != nil {
+		return fmt.Errorf("git checkout: %s: %w", out, err)
+	}
+	slog.Info("workspace history restored", "scope", scope, "commit", commit)
+	return nil
+}
+
+func isHexHash(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // RepoPath returns the bare repository path for a scope (used by tests and
 // by any future rollback UI).
 func (h *History) RepoPath(scope string) string {
