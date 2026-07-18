@@ -1713,13 +1713,18 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	if catalog != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sess.GetMessages(), chatterUID)...)
+	messages = append(messages, withConversationGapContext(sess.GetMessages())...)
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
 	}
 
 	resp, err := a.streamChatToResponse(ctx, messages, nil)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("plan-mode chat canceled", "agent", a.name)
+			emitEvent(ctx, ChatEvent{Type: "done"})
+			return ""
+		}
 		slog.Error("plan-mode chat failed", "agent", a.name, "error", err)
 		emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 		emitEvent(ctx, ChatEvent{Type: "done"})
@@ -2009,7 +2014,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
+	messages = append(messages, withConversationGapContext(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -2089,6 +2094,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
+			// Cancellation is a control-flow outcome (Stop, shutdown, or a
+			// disconnected caller), not a provider failure. Publishing it as
+			// an error leaves a persisted "context canceled" bubble that can
+			// arrive after the UI has already rendered "(Stopped)".
+			if errors.Is(err, context.Canceled) {
+				slog.Info("LLM chat canceled", "agent", a.name)
+				emitEvent(ctx, ChatEvent{Type: "done"})
+				return ""
+			}
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
@@ -2705,7 +2719,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
+	messages = append(messages, withConversationGapContext(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -3171,28 +3185,51 @@ func (a *Agent) chatterLocation(chatterUID string) *time.Location {
 	return scope.LoadLocationOrLocal(tz)
 }
 
-// withMessageTimestamps returns a COPY of msgs where each user message is
-// prefixed with its send time in the chatter's timezone, e.g.
-// "[2026-06-13 22:15 Fri] …". This is what lets the model reason about
-// time across a conversation — tell today from earlier days, and not say
-// "good night" at midday. The originals are never mutated (the prefix is
-// a read-time view for the LLM, not stored history), so the session store
-// stays clean and the next turn doesn't double-prefix. The system prompt
-// (context.go dateLine) tells the model what the bracketed prefix means.
-func (a *Agent) withMessageTimestampsForChatter(msgs []provider.Message, chatterUID string) []provider.Message {
-	if len(msgs) == 0 {
+const conversationGapThreshold = 24 * time.Hour
+
+// withConversationGapContext keeps message bodies clean while still telling
+// the model when the latest turn resumes a stale conversation. Timestamps stay
+// in message metadata and are never rendered as user-visible text.
+func withConversationGapContext(msgs []provider.Message) []provider.Message {
+	if len(msgs) < 2 {
 		return msgs
 	}
-	loc := a.chatterLocation(chatterUID)
-	out := make([]provider.Message, len(msgs))
-	for i, m := range msgs {
-		if m.Role == "user" && m.Timestamp > 0 && m.Content != "" {
-			t := time.UnixMilli(m.Timestamp).In(loc)
-			m.Content = "[" + t.Format("2006-01-02 15:04 Mon") + "] " + m.Content
-		}
-		out[i] = m
+	latest := msgs[len(msgs)-1]
+	if latest.Role != "user" || latest.Timestamp <= 0 {
+		return msgs
 	}
+
+	var previousTimestamp int64
+	for i := len(msgs) - 2; i >= 0; i-- {
+		if msgs[i].Timestamp > 0 && (msgs[i].Role == "user" || msgs[i].Role == "assistant") {
+			previousTimestamp = msgs[i].Timestamp
+			break
+		}
+	}
+	gap := time.Duration(latest.Timestamp-previousTimestamp) * time.Millisecond
+	if previousTimestamp == 0 || gap < conversationGapThreshold {
+		return msgs
+	}
+
+	note := fmt.Sprintf(
+		"Conversation timing context: the latest user message arrived after %s of inactivity. "+
+			"Treat it as a resumed conversation in the current moment. Use earlier messages as background, "+
+			"but do not assume their time-sensitive situation is still current and do not repeat an earlier answer unless the user asks for it. "+
+			"Keep this timing context silent; do not mention the gap or report timestamps.",
+		formatConversationGap(gap),
+	)
+	out := make([]provider.Message, 0, len(msgs)+1)
+	out = append(out, provider.Message{Role: "system", Content: note})
+	out = append(out, msgs...)
 	return out
+}
+
+func formatConversationGap(gap time.Duration) string {
+	days := int(gap / (24 * time.Hour))
+	if days >= 2 {
+		return fmt.Sprintf("about %d days", days)
+	}
+	return "more than a day"
 }
 
 // UpdateConfig updates the agent's runtime config (model, temperature, etc.)
