@@ -2052,6 +2052,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// Hook: BeforeModelCall
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
+		// Read back messages that may have been modified by sync hooks (e.g., mem0)
+		messages = hcBefore.Messages
 
 		// PII scrubbing: redact sensitive data before sending to LLM
 		llmMessages := messages
@@ -2730,6 +2732,8 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	for i := 0; i < a.maxToolIterations; i++ {
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
+		// Read back messages that may have been modified by sync hooks (e.g., mem0)
+		messages = hcBefore.Messages
 
 		dumpLLMRequest(a.name, a.model, messages, toolDefs)
 		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
