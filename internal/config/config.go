@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -533,6 +534,36 @@ func defaultAgentFileConfigLoader(_, home string) (AgentFileConfig, bool) {
 		return AgentFileConfig{}, false
 	}
 	return cfg, true
+}
+
+// MergeAgentFileAdmins writes the admins allowlist into <home>/agent.json,
+// preserving every other field already in the file (raw-map merge, not a
+// struct round-trip, so keys this build doesn't know about survive).
+// Fallback persistence for the first-DM admin claim when no store-backed
+// agents.config row is available; the store path lives on the Agent.
+func MergeAgentFileAdmins(home string, admins map[string][]string) error {
+	if home == "" {
+		return fmt.Errorf("agent home not set")
+	}
+	path := filepath.Join(home, "agent.json")
+	raw := map[string]json.RawMessage{}
+	if data, err := os.ReadFile(path); err == nil {
+		// Corrupt existing JSON → start fresh rather than fail the claim.
+		_ = json.Unmarshal(data, &raw)
+	}
+	blob, err := json.Marshal(admins)
+	if err != nil {
+		return err
+	}
+	raw["admins"] = blob
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o600)
 }
 
 // AgentFileConfig is the schema for an agent's per-row override JSON

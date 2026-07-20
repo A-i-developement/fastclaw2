@@ -129,10 +129,14 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 		return slashResult{handled: true, reply: fmt.Sprintf("⚡ FastClaw\nAgent: %s\nModel: %s", a.name, a.model)}
 
 	case "/whoami":
+		adminLine := "no — operator-only actions (host shell, agent management, write-slash commands) are unavailable"
+		if a.isAdminChatter(msg) {
+			adminLine = "yes"
+		}
 		return slashResult{
 			handled: true,
-			reply: fmt.Sprintf("Channel: `%s`\nYour user ID: `%s`\nSender name: `%s`\n\n(Add this ID to `admins.%s` in the agent config to grant write-slash access.)",
-				msg.Channel, msg.UserID, msg.SenderName, msg.Channel),
+			reply: fmt.Sprintf("Channel: `%s`\nYour user ID: `%s`\nSender name: `%s`\nAdmin: %s\n\n(The operator can add this ID to `admins.%s` in the agent config to grant admin access.)",
+				msg.Channel, msg.UserID, msg.SenderName, adminLine, msg.Channel),
 		}
 
 	default:

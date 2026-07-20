@@ -240,6 +240,98 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	a.registry.SetExecutor(ex)
 }
 
+// maybeClaimChannelAdmin implements first-DM-wins operator claiming on
+// self-hosted installs: the first human to DM the agent on an IM channel
+// that has no admins allowlist AND no prior chat history on that channel
+// becomes the channel's admin. Rationale: the operator who just bound
+// their own bot token is invariably the first to message it — making
+// them hand-edit an admins list for their own agent is friction with no
+// security payoff. The claim never fires when:
+//   - the deploy is hosted (strangers everywhere),
+//   - the turn is runtime-originated (cron / heartbeat / subagent),
+//   - the message came from a group (the first speaker could be anyone),
+//   - an admins list for the channel already exists (explicit config wins),
+//   - the channel already has other chat history (an agent that has been
+//     serving the public must not hand admin to whoever messages next
+//     after an upgrade).
+//
+// Persisted through the same layer AgentFileConfigLoader reads (the
+// agents.config row via dataStore, agent.json in file mode) so the claim
+// survives restarts.
+func (a *Agent) maybeClaimChannelAdmin(ctx context.Context, msg bus.InboundMessage) {
+	if buildinfo.IsHostedDeploy() || msg.Source != bus.SourceUser {
+		return
+	}
+	switch msg.Channel {
+	case "", "web", "api":
+		return
+	}
+	if msg.PeerKind != "dm" || msg.UserID == "" {
+		return
+	}
+	if len(a.admins[msg.Channel]) > 0 {
+		return
+	}
+	if a.channelHasHistory(ctx, msg.Channel, msg.ChatID) {
+		return
+	}
+	if a.admins == nil {
+		a.admins = map[string][]string{}
+	}
+	a.admins[msg.Channel] = []string{msg.UserID}
+	if err := a.persistAdmins(ctx); err != nil {
+		slog.Warn("channel-admin claim not persisted (active for this process only)",
+			"agent", a.name, "channel", msg.Channel, "error", err)
+	}
+	slog.Info("channel admin claimed by first DM chatter",
+		"agent", a.name, "channel", msg.Channel, "userID", msg.UserID, "sender", msg.SenderName)
+}
+
+// channelHasHistory reports whether any OTHER chat session exists for
+// (agent, channel). Errors count as history — when in doubt, don't grant
+// admin. Bounded page walk; sessions are updated_at-ordered so an active
+// channel surfaces in the first page.
+func (a *Agent) channelHasHistory(ctx context.Context, channel, currentChatID string) bool {
+	if a.dataStore == nil {
+		// File-mode single-user install: no cross-chatter history to protect.
+		return false
+	}
+	const pageSize = 200
+	for page := range 20 {
+		metas, total, err := a.dataStore.ListSessionsPaginated(ctx, []string{a.name}, page*pageSize, pageSize)
+		if err != nil {
+			return true
+		}
+		for _, m := range metas {
+			if m.Channel == channel && m.ChatID != currentChatID {
+				return true
+			}
+		}
+		if (page+1)*pageSize >= total || len(metas) == 0 {
+			return false
+		}
+	}
+	// Thousands of sessions and still unsure — stay conservative.
+	return true
+}
+
+// persistAdmins writes the in-memory admins allowlist to the layer
+// AgentFileConfigLoader reads it back from on the next boot.
+func (a *Agent) persistAdmins(ctx context.Context) error {
+	if a.dataStore != nil {
+		rec, err := a.dataStore.GetAgent(ctx, a.name)
+		if err == nil && rec != nil {
+			if rec.Config == nil {
+				rec.Config = map[string]interface{}{}
+			}
+			rec.Config["admins"] = a.admins
+			return a.dataStore.SaveAgent(ctx, rec)
+		}
+		// Lookup miss (agent not in store) → fall through to file.
+	}
+	return config.MergeAgentFileAdmins(a.homePath, a.admins)
+}
+
 // NewAgent creates a new Agent from a resolved config.
 func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string) *Agent {
 	return NewAgentWithSkillsCfg(rc, prov, mb, homeDir, config.SkillsCfg{})
@@ -1956,6 +2048,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// admin. File tools use this to refuse identity-file reads from
 	// regular chatters (SOUL/IDENTITY/BOOTSTRAP/... leak as verbatim
 	// chat replies otherwise).
+	a.maybeClaimChannelAdmin(ctx, msg)
 	a.registry.SetCallerIsAdmin(a.isTrustedTurn(msg))
 	// Plumb the persistent session_key for goal-scoped tools.
 	// SetSessionID above uses msg.ChatID (the channel-level chat
@@ -2717,6 +2810,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		sess.SetProviderModel(prov, mdl)
 	}
 	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	a.maybeClaimChannelAdmin(ctx, msg)
 	a.registry.SetCallerIsAdmin(a.isTrustedTurn(msg))
 	a.registry.SetGoalSessionKey(sess.SessionKey())
 	// Per-user file writes (USER.md / MEMORY.md) need to land in the
