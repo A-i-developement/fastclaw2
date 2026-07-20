@@ -190,6 +190,17 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 	if msg.Channel == "web" || msg.Channel == "api" {
 		return msg.UserID != "" && msg.UserID == a.ownerUserID
 	}
+	// Shared-identity channels rewrite EVERY speaker's UserID to the
+	// channel owner's id (routing.processInbound), which makes the
+	// owner-equality check below meaningless in groups: any group member
+	// would pass as the owner. The platform-side sender id is gone by
+	// this point, so there's nothing to match against an allowlist
+	// either — deny. DMs on a shared-identity channel are fine: the
+	// owner marked the channel as personally theirs, and a DM sender on
+	// their own bot is them by construction.
+	if msg.SharedIdentity && msg.PeerKind == "group" {
+		return false
+	}
 	list, ok := a.admins[msg.Channel]
 	if !ok || len(list) == 0 {
 		// No allowlist configured for this channel. Fall back to
