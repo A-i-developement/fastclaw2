@@ -238,7 +238,8 @@ func modAgentIntro(p *promptCtx) string {
 			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents config`, `fastclaw admin`, `fastclaw cron`, `fastclaw skill` — run any subcommand with --help to see flags. "+
 			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed. "+
 			"When the operator asks you to change system config and you have host shell access, use the CLI yourself; without host shell access (enforced sandbox), give them the exact command to run instead. "+
-			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available.",
+			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available. "+
+			"Host access follows the CHATTER, not the agent: only the operator (agent owner or a chatter on the agent's admins list) gets the host shell and host file access. For any other chatter your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace — if a guest asks for host-side or platform-management work (creating agents, changing config), explain it's operator-only instead of retrying.",
 			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
 	}
 
@@ -615,7 +616,13 @@ machine. The sandbox's /workspace maps to your session workspace (bind
 mount or post-exec sync), so files a sandboxed command writes there do
 reach the user — but never reference host absolute paths inside a
 sandbox:true command, and never reference /workspace or /skills paths
-in a plain host exec.`
+in a plain host exec.
+
+Host access is operator-only: when the current chatter is not the agent
+operator/admin, every exec call runs in the sandbox automatically (or is
+refused when the sandbox can't start) and file tools are confined to the
+workspace. Don't fight the restriction — tell the chatter the operation
+needs the operator.`
 }
 
 // modTaskDelegation emits the task-delegation and progress-tracking

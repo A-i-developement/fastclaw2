@@ -203,6 +203,23 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 	return false
 }
 
+// isTrustedTurn decides whether the current turn may touch the HOST
+// (host-shell exec, file access outside the workspace) on a self-hosted
+// install. Admin chatters qualify (isAdminChatter). Heartbeat turns do
+// too: their instructions come from HEARTBEAT.md, which the
+// identity-file gate keeps writable only by admin chatters. Cron
+// replays and subagent spawns stay untrusted even though they're
+// runtime-originated — their payload text was authored in some earlier
+// chat turn whose chatter can't be verified here, so a guest could park
+// a hostile command in a cron job and have it replayed with elevated
+// rights.
+func (a *Agent) isTrustedTurn(msg bus.InboundMessage) bool {
+	if msg.Source == bus.SourceHeartbeat {
+		return true
+	}
+	return a.isAdminChatter(msg)
+}
+
 // slashRetry re-runs the last user message, discarding the last assistant response.
 func (a *Agent) slashRetry(msg bus.InboundMessage) slashResult {
 	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)

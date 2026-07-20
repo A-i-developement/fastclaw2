@@ -149,6 +149,17 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 		// it, or admin flipped settings.sandbox.enabled mid-process).
 		useSandbox := args.Sandbox || (sbCfg != nil && sbCfg.Enabled) || (r != nil && r.sandboxRequired)
 
+		// Host shell is operator territory. When the current turn isn't
+		// admin-trusted (anonymous IM chatter, cron replay, subagent
+		// spawn — see Agent.isTrustedTurn), force the sandbox path: the
+		// command runs in the container when one is wired and is refused
+		// otherwise. This is what keeps "able to reach the agent" from
+		// meaning "able to run `fastclaw admin` on the operator's machine".
+		guest := r != nil && !r.callerIsAdmin
+		if guest {
+			useSandbox = true
+		}
+
 		// Background mode is host-only in v1. Sandbox-mode background
 		// would need StartBackground / Poll / Kill on sandbox.Executor
 		// (or per-backend tmux-inside-container plumbing) — both are
@@ -200,6 +211,9 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 		// clear error gives the model a chance to surface it instead of
 		// the user seeing host-shell `command not found` mysteries.
 		if useSandbox {
+			if guest {
+				return "", fmt.Errorf("host execution is restricted to the agent operator, and no sandbox is configured for guest chatters — the command was NOT run. The operator can enable a sandbox in system settings, or add this chatter's platform ID to the agent's admins list to grant host access")
+			}
 			return "", fmt.Errorf("sandbox required but no executor available — check that the sandbox backend (docker / e2b) is reachable and the configured image (%q) can start", sbCfgImage(sbCfg))
 		}
 
@@ -356,6 +370,12 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 			var args execArgs
 			if err := json.Unmarshal(rawArgs, &args); err != nil {
 				return "", fmt.Errorf("parse args: %w", err)
+			}
+			// Same trust boundary as the exec tool's host path: the
+			// escape hatch is for the operator, not for whoever manages
+			// to reach the agent on a public IM channel.
+			if !r.callerIsAdmin {
+				return "", fmt.Errorf("host_exec is restricted to the agent operator (admin chatters only)")
 			}
 			if args.Command == "" {
 				return "", fmt.Errorf("command is required")
