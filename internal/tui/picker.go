@@ -86,7 +86,7 @@ func (p *pickerModel) View() string {
 	var b strings.Builder
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render(p.Title))
 	if p.filter != "" {
-		b.WriteString("  " + styleMuted.Render("筛选: "+p.filter))
+		b.WriteString("  " + styleMuted.Render("filter: "+p.filter))
 	}
 	b.WriteString("\n")
 
@@ -97,7 +97,7 @@ func (p *pickerModel) View() string {
 	}
 	end := min(start+window, len(items))
 	if len(items) == 0 {
-		b.WriteString(styleMuted.Render("（无匹配项）"))
+		b.WriteString(styleMuted.Render("(no matches)"))
 	}
 	for i := start; i < end; i++ {
 		it := items[i]
@@ -116,10 +116,10 @@ func (p *pickerModel) View() string {
 		}
 	}
 	if end < len(items) {
-		b.WriteString(styleDim.Render("  … 还有更多，输入文字筛选"))
+		b.WriteString(styleDim.Render("  … more below, type to filter"))
 		b.WriteString("\n")
 	}
-	b.WriteString(styleDim.Render("↑↓ 选择 · Enter 确认 · Esc 取消"))
+	b.WriteString(styleDim.Render("↑↓ select · Enter confirm · Esc cancel"))
 	return stylePickerBox.Width(min(p.width-4, 100)).Render(b.String())
 }
 

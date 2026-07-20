@@ -193,7 +193,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case historyMsg:
 		if msg.err != nil {
-			m.errMsg = "加载历史失败: " + msg.err.Error()
+			m.errMsg = "load history: " + msg.err.Error()
 		} else {
 			m.blocks = m.blocks[:0]
 			for _, h := range msg.msgs {
@@ -205,7 +205,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			if len(msg.msgs) > 0 {
-				m.appendSystem(fmt.Sprintf("已恢复会话（%d 条消息）", len(msg.msgs)), false)
+				m.appendSystem(fmt.Sprintf("Resumed session (%d messages)", len(msg.msgs)), false)
 			}
 		}
 		m.refreshViewport()
@@ -213,7 +213,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionPickerMsg:
 		if msg.err != nil {
-			m.errMsg = "加载会话失败: " + msg.err.Error()
+			m.errMsg = "load sessions: " + msg.err.Error()
 			m.refreshViewport()
 			return m, nil
 		}
@@ -228,7 +228,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			items = append(items, pickerItem{ID: s.ID, Title: truncateANSI(title, 48), Desc: formatRelativeTime(s.UpdatedAt)})
 		}
-		m.picker = newPicker("切换会话", items, m.width)
+		m.picker = newPicker("Switch session", items, m.width)
 		m.pickerType = pickerSessions
 		m.input.Blur()
 		return m, nil
@@ -243,14 +243,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case steerResultMsg:
 		if msg.err != nil {
-			m.errMsg = "steer 失败: " + msg.err.Error()
+			m.errMsg = "steer: " + msg.err.Error()
 		} else if msg.buffered {
-			m.appendSystem("↪ 已并入当前回合: "+msg.text, false)
+			m.appendSystem("↪ Steered into the current turn: "+msg.text, false)
 		} else {
 			// No in-flight turn on the server; send it as a normal
 			// turn once the local stream settles.
 			m.queued = append(m.queued, msg.text)
-			m.appendSystem("已排队，待本回合结束后发送: "+msg.text, false)
+			m.appendSystem("Queued; will send when this turn finishes: "+msg.text, false)
 		}
 		m.refreshViewport()
 		return m, nil
@@ -264,7 +264,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			out += msg.err.Error()
 		}
 		if out == "" {
-			out = "(无输出)"
+			out = "(no output)"
 		}
 		m.appendSystem(out, msg.err != nil)
 		m.refreshViewport()
@@ -305,7 +305,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.ctrlCArm = time.Now()
-		m.appendSystem("再按一次 Ctrl+C 退出", false)
+		m.appendSystem("Press Ctrl+C again to quit", false)
 		m.refreshViewport()
 		return m, nil
 
@@ -383,7 +383,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSlash(name, args)
 	}
 	if strings.HasPrefix(text, "/") {
-		m.appendSystem("未知命令 "+text+"，输入 /help 查看可用命令", true)
+		m.appendSystem("Unknown command "+text+"; type /help for available commands", true)
 		m.refreshViewport()
 		return m, nil
 	}
@@ -413,29 +413,29 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 		m.sessionID = cliclient.NewSessionID()
 		m.sessionTitle = ""
 		m.blocks = nil
-		m.appendSystem("已开启新会话", false)
+		m.appendSystem("Started a new session", false)
 
 	case "/clear":
 		m.blocks = nil
 
 	case "/web":
-		m.appendSystem("Web 控制台: "+m.client.BaseURL(), false)
+		m.appendSystem("Web dashboard: "+m.client.BaseURL(), false)
 
 	case "/rename":
 		if args == "" {
-			m.appendSystem("用法：/rename <新标题>", true)
+			m.appendSystem("Usage: /rename <title>", true)
 			break
 		}
 		sessionID := m.sessionID
 		client := m.client
 		m.sessionTitle = args
-		m.appendSystem("已重命名会话: "+args, false)
+		m.appendSystem("Renamed session: "+args, false)
 		m.refreshViewport()
 		return m, func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := client.RenameSession(ctx, sessionID, args); err != nil {
-				return shellResultMsg{err: fmt.Errorf("重命名失败: %w", err)}
+				return shellResultMsg{err: fmt.Errorf("rename: %w", err)}
 			}
 			return nil
 		}
@@ -455,11 +455,11 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 		for _, a := range m.agents {
 			desc := a.Model
 			if a.ID == m.agent.ID {
-				desc += "（当前）"
+				desc += " (current)"
 			}
 			items = append(items, pickerItem{ID: a.ID, Title: a.Name, Desc: desc})
 		}
-		m.picker = newPicker("切换 Agent", items, m.width)
+		m.picker = newPicker("Switch agent", items, m.width)
 		m.pickerType = pickerAgents
 		m.input.Blur()
 
@@ -488,7 +488,7 @@ func (m *Model) applyPickerChoice(kind pickerKind, it pickerItem) (tea.Model, te
 		m.sessionID = cliclient.NewSessionID()
 		m.sessionTitle = ""
 		m.blocks = nil
-		m.appendSystem(fmt.Sprintf("已切换到 %s，开启新会话", m.agent.Name), false)
+		m.appendSystem(fmt.Sprintf("Switched to %s; started a new session", m.agent.Name), false)
 		m.refreshViewport()
 	}
 	return m, nil
@@ -595,7 +595,7 @@ func (m *Model) handleStreamEvent(ev cliclient.Event) {
 
 	case "steer":
 		if text := ev.Str("message"); text != "" {
-			m.appendSystem("↪ 已并入: "+text, false)
+			m.appendSystem("↪ Steered: "+text, false)
 		}
 
 	case "turn_pending":
@@ -632,9 +632,9 @@ func (m *Model) finishTurn(err error) (tea.Model, tea.Cmd) {
 	}
 	switch {
 	case err == nil:
-		m.appendSystem("✦ 完成，用时 "+formatDuration(time.Since(m.turnStart)), false)
+		m.appendSystem("✦ Done in "+formatDuration(time.Since(m.turnStart)), false)
 	case errIsCancel(err):
-		m.appendSystem("已脱离本回合；服务端会继续执行并把回复存入会话（/sessions 可回看）", false)
+		m.appendSystem("Detached from this turn; the server keeps running and saves the reply (see /sessions)", false)
 	default:
 		m.appendSystem(err.Error(), true)
 	}
@@ -726,7 +726,7 @@ func (m *Model) renderWelcome() string {
 	}
 	b.WriteString("\n")
 	b.WriteString("  " + styleMuted.Render("web:   ") + m.client.BaseURL() + "\n\n")
-	b.WriteString("  " + styleDim.Render("输入消息开始对话；/help 查看命令与快捷键") + "\n")
+	b.WriteString("  " + styleDim.Render("Type a message to start; /help for commands and keys") + "\n")
 	return b.String()
 }
 
@@ -750,20 +750,20 @@ func (m *Model) renderHeader() string {
 
 func (m *Model) renderActivity() string {
 	elapsed := formatDuration(time.Since(m.turnStart))
-	label := "思考中…"
+	label := "Thinking…"
 	for id := range m.toolsByID {
 		if t := m.toolsByID[id]; t != nil && !t.Done {
-			label = "运行 " + t.Name + "…"
+			label = "Running " + t.Name + "…"
 			break
 		}
 	}
 	if m.turnPending {
-		label = "等待后续回合…"
+		label = "Waiting for the follow-up turn…"
 	}
 	line := fmt.Sprintf("  %s %s %s",
 		m.spin.View(),
 		stylePrimary.Render(label),
-		styleMuted.Render("("+elapsed+" · Esc 脱离)"))
+		styleMuted.Render("("+elapsed+" · Esc to detach)"))
 	if m.subagentNote != "" {
 		line += styleDim.Render("  " + truncateANSI(m.subagentNote, 48))
 	}
@@ -786,12 +786,12 @@ func (m *Model) renderSlashSuggestions() string {
 func (m *Model) renderStatusBar() string {
 	var parts []string
 	if m.querying {
-		parts = append(parts, styleSuccess.Render("● 回复中"))
+		parts = append(parts, styleSuccess.Render("● replying"))
 	} else {
-		parts = append(parts, styleMuted.Render("○ 空闲"))
+		parts = append(parts, styleMuted.Render("○ idle"))
 	}
 	if len(m.queued) > 0 {
-		parts = append(parts, styleMuted.Render(fmt.Sprintf("%d 条排队", len(m.queued))))
+		parts = append(parts, styleMuted.Render(fmt.Sprintf("%d queued", len(m.queued))))
 	}
 	parts = append(parts, styleDim.Render(m.client.BaseURL()))
 	left := " " + strings.Join(parts, styleDim.Render(" │ "))
@@ -809,7 +809,7 @@ func (m *Model) renderStatusBar() string {
 
 func (m *Model) View() string {
 	if !m.ready {
-		return "\n  " + m.spin.View() + " 正在启动…\n"
+		return "\n  " + m.spin.View() + " Starting…\n"
 	}
 	var b strings.Builder
 	b.WriteString(m.renderHeader())

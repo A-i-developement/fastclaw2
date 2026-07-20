@@ -10,14 +10,14 @@ type slashCommand struct {
 }
 
 var slashCommands = []slashCommand{
-	{Name: "/new", Description: "开启新会话"},
-	{Name: "/sessions", Aliases: []string{"/resume"}, Description: "浏览并切换历史会话"},
-	{Name: "/agents", Aliases: []string{"/agent"}, Description: "切换 agent"},
-	{Name: "/rename", Description: "重命名当前会话：/rename <标题>"},
-	{Name: "/clear", Description: "清空屏幕（不影响服务端会话）"},
-	{Name: "/web", Description: "显示 Web 控制台地址"},
-	{Name: "/help", Description: "显示帮助"},
-	{Name: "/exit", Aliases: []string{"/quit"}, Description: "退出"},
+	{Name: "/new", Description: "Start a new session"},
+	{Name: "/sessions", Aliases: []string{"/resume"}, Description: "Browse and switch sessions"},
+	{Name: "/agents", Aliases: []string{"/agent"}, Description: "Switch agent"},
+	{Name: "/rename", Description: "Rename the current session: /rename <title>"},
+	{Name: "/clear", Description: "Clear the screen (server session is untouched)"},
+	{Name: "/web", Description: "Show the web dashboard URL"},
+	{Name: "/help", Description: "Show help"},
+	{Name: "/exit", Aliases: []string{"/quit"}, Description: "Quit"},
 }
 
 // matchSlashCommands returns commands whose name or alias starts with
@@ -66,7 +66,7 @@ func canonicalSlash(text string) (name, args string) {
 
 func helpText() string {
 	var b strings.Builder
-	b.WriteString("命令：\n")
+	b.WriteString("Commands:\n")
 	for _, c := range slashCommands {
 		name := c.Name
 		if len(c.Aliases) > 0 {
@@ -74,15 +74,15 @@ func helpText() string {
 		}
 		b.WriteString("  " + padRight(name, 24) + c.Description + "\n")
 	}
-	b.WriteString("\n快捷键：\n")
-	b.WriteString("  Enter          发送（回复中则并入当前回合）\n")
-	b.WriteString("  Shift+Enter    换行（或 Ctrl+J）\n")
-	b.WriteString("  ↑ / ↓          输入历史\n")
-	b.WriteString("  PgUp / PgDn    滚动对话\n")
-	b.WriteString("  Esc            回复中：脱离本次回合（服务端继续跑完并保存）\n")
-	b.WriteString("  Ctrl+L         清屏\n")
-	b.WriteString("  Ctrl+C ×2 / Ctrl+D  退出\n")
-	b.WriteString("\n以 ! 开头在本机 shell 执行命令，例如 ! git status\n")
+	b.WriteString("\nKeys:\n")
+	b.WriteString("  Enter          send (during a reply: steer into the current turn)\n")
+	b.WriteString("  Shift+Enter    newline (or Ctrl+J)\n")
+	b.WriteString("  ↑ / ↓          input history\n")
+	b.WriteString("  PgUp / PgDn    scroll the transcript\n")
+	b.WriteString("  Esc            during a reply: detach (the server finishes and saves it)\n")
+	b.WriteString("  Ctrl+L         clear the screen\n")
+	b.WriteString("  Ctrl+C ×2 / Ctrl+D  quit\n")
+	b.WriteString("\nStart a line with ! to run a local shell command, e.g. ! git status\n")
 	return strings.TrimRight(b.String(), "\n")
 }
 

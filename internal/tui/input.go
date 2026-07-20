@@ -23,7 +23,7 @@ type inputModel struct {
 
 func newInputModel() *inputModel {
 	ta := textarea.New()
-	ta.Placeholder = "输入消息…（Enter 发送，Shift+Enter 换行，/ 查看命令）"
+	ta.Placeholder = "Type a message… (Enter to send, Shift+Enter for newline, / for commands)"
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.MaxHeight = 10

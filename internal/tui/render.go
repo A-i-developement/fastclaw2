@@ -43,7 +43,7 @@ func renderUserBlock(content string, width int) string {
 
 	if len(content) > 4000 {
 		lines := strings.Count(content, "\n")
-		content = content[:2000] + fmt.Sprintf("\n… +%d 行 …", lines)
+		content = content[:2000] + fmt.Sprintf("\n… +%d lines …", lines)
 	}
 	wrapped := wordwrap.String(content, max(width-6, 20))
 	for idx, line := range strings.Split(wrapped, "\n") {
@@ -140,12 +140,12 @@ func formatRelativeTime(ts int64) string {
 	d := time.Since(time.UnixMilli(ts))
 	switch {
 	case d < time.Minute:
-		return "刚刚"
+		return "just now"
 	case d < time.Hour:
-		return fmt.Sprintf("%d 分钟前", int(d.Minutes()))
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
 	case d < 24*time.Hour:
-		return fmt.Sprintf("%d 小时前", int(d.Hours()))
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	default:
-		return fmt.Sprintf("%d 天前", int(d.Hours()/24))
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 }
