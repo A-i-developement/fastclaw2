@@ -318,7 +318,8 @@ func runChatREPL(ctx context.Context, c *chatClient, agent cliAgent, sessionID s
 	if agent.Model != "" {
 		fmt.Printf(" · model: %s", agent.Model)
 	}
-	fmt.Println("\nType /help for commands.")
+	fmt.Printf("\nWeb: %s\n", c.baseURL)
+	fmt.Println("Type /help for commands.")
 	fmt.Println()
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
