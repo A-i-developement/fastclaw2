@@ -86,7 +86,7 @@ func registerExecFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 			},
 			"sandbox": map[string]interface{}{
 				"type":        "boolean",
-				"description": "Force execution in sandbox container",
+				"description": "Run this one command inside the sandbox container (isolated FS with /workspace and read-only /skills mounts) instead of the default shell. Use it for the sandbox's pre-installed toolchain or when isolation is wanted; leave unset to run in the default environment.",
 			},
 			"run_in_background": map[string]interface{}{
 				"type":        "boolean",
@@ -180,6 +180,17 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 			sb := sbCfg.Pool.Get(sbCfg.AgentID, sbCfg.Image, sbCfg.Workspace, sbCfg.Policy)
 			out, err := sb.Exec(execCtx, command, "/workspace")
 			return MetaSandboxPrefix + out, err
+		}
+		// Optional-sandbox mode (self-hosted): host shell is the default,
+		// but the model asked for the sandbox explicitly (sandbox:true).
+		// Resolve the per-session executor lazily — the container only
+		// starts when someone actually wants it.
+		if useSandbox && r != nil && r.sandboxProvider != nil {
+			ex, err := r.sandboxProvider(execCtx)
+			if err != nil {
+				return "", fmt.Errorf("sandbox unavailable: %w — the command was NOT run. Retry without sandbox:true to run it on the host instead, if host execution is acceptable", err)
+			}
+			return runSandboxedCommand(ctx, ex, args, envProvider, skillDirs)
 		}
 		// Sandbox was requested but no executor is wired — refuse rather
 		// than running on the host shell. SetExecutor swaps this closure
@@ -426,63 +437,76 @@ func registerSandboxedExec(r *Registry, ex sandbox.Executor) {
 		if args.RunInBackground {
 			return "", fmt.Errorf("run_in_background is not yet supported in sandbox mode — use tmux inside the sandbox instead: exec({command: \"tmux new-session -d -s job '<your command>'\"}) to start, exec({command: \"tmux capture-pane -t job -p\"}) to read, exec({command: \"tmux kill-session -t job\"}) to stop")
 		}
-		timeout := 120
-		if args.Timeout > 0 {
-			timeout = args.Timeout
-		}
-		command := args.Command
-		// Stdin via heredoc (mirror the host path) so callers can pipe
-		// JSON args to a skill script.
-		if args.Stdin != "" {
-			command = fmt.Sprintf("(cat <<'__FCSTDIN__'\n%s\n__FCSTDIN__\n) | %s", args.Stdin, args.Command)
-		}
-		// Inject the configured env for whichever skill the command
-		// references (SK skill dirs may be host paths or the
-		// container-internal /skills/<name> mount — resolveSkillEnv
-		// matches both).
-		injected := []string{}
-		if envProvider != nil {
-			skillEnv := resolveSkillEnv(args.Command, envProvider, skillDirs)
-			if len(skillEnv) > 0 {
-				var sb strings.Builder
-				for k, v := range skillEnv {
-					sb.WriteString("export ")
-					sb.WriteString(k)
-					sb.WriteString("=")
-					sb.WriteString(shellQuote(v))
-					sb.WriteString("; ")
-					if v == "" {
-						injected = append(injected, k+"=<empty>")
-					} else {
-						injected = append(injected, k+"=<set "+strconv.Itoa(len(v))+"chars>")
-					}
+		return runSandboxedCommand(ctx, ex, args, envProvider, skillDirs)
+	})
+}
+
+// runSandboxedCommand executes args inside the sandbox executor: stdin
+// delivered via heredoc (mirroring the host path), skill env vars
+// injected as `export` prefixes (sandbox.Executor.Exec only accepts a
+// single command string, so env can't ride a process attribute), and
+// the result stamped with MetaSandboxPrefix. Shared by the enforced
+// path (registerSandboxedExec, where exec ALWAYS lands here) and the
+// optional path (makeExecToolFull, where the model opted in with
+// sandbox:true).
+func runSandboxedCommand(ctx context.Context, ex sandbox.Executor, args execArgs, envProvider SkillEnvProvider, skillDirs []string) (string, error) {
+	timeout := 120
+	if args.Timeout > 0 {
+		timeout = args.Timeout
+	}
+	command := args.Command
+	if args.Stdin != "" {
+		command = fmt.Sprintf("(cat <<'__FCSTDIN__'\n%s\n__FCSTDIN__\n) | %s", args.Stdin, args.Command)
+	}
+	// Inject the configured env for whichever skill the command
+	// references (skill dirs may be host paths or the
+	// container-internal /skills/<name> mount — resolveSkillEnv
+	// matches both).
+	injected := []string{}
+	if envProvider != nil {
+		skillEnv := resolveSkillEnv(args.Command, envProvider, skillDirs)
+		if len(skillEnv) > 0 {
+			var sb strings.Builder
+			for k, v := range skillEnv {
+				sb.WriteString("export ")
+				sb.WriteString(k)
+				sb.WriteString("=")
+				sb.WriteString(shellQuote(v))
+				sb.WriteString("; ")
+				if v == "" {
+					injected = append(injected, k+"=<empty>")
+				} else {
+					injected = append(injected, k+"=<set "+strconv.Itoa(len(v))+"chars>")
 				}
-				sb.WriteString(command)
-				command = sb.String()
 			}
+			sb.WriteString(command)
+			command = sb.String()
 		}
-		slog.Info("sandboxed exec",
-			"backend", ex.Backend(),
-			"envProviderSet", envProvider != nil,
-			"skillDirsCount", len(skillDirs),
-			"injected", injected,
-			"cmdHead", firstN(args.Command, 80))
-		out, err := ex.Exec(ctx, command, time.Duration(timeout)*time.Second)
-		// Hint, don't auto-fall-back: an auto-retry to host shell would
-		// silently breach the sandbox boundary on any prompt-injected
-		// "make it fail in sandbox" trick AND would re-run a possibly
-		// wrong command in a different filesystem. Surface a hint
-		// instead so the LLM (or its operator-trained ChatBot) makes
-		// an explicit decision. Only attach the hint when host_exec is
-		// actually available — on hosted deployments it's not, and
-		// suggesting a tool that doesn't exist just confuses the
-		// model. We probe by tool name so the check is decoupled from
-		// the deploy-mode flag — same answer, less coupling.
-		if err != nil && looksLikeSandboxAbsence(err, out) && buildinfo.IsHostExecAllowed() {
+	}
+	slog.Info("sandboxed exec",
+		"backend", ex.Backend(),
+		"envProviderSet", envProvider != nil,
+		"skillDirsCount", len(skillDirs),
+		"injected", injected,
+		"cmdHead", firstN(args.Command, 80))
+	out, err := ex.Exec(ctx, command, time.Duration(timeout)*time.Second)
+	// Hint, don't auto-fall-back: an auto-retry to host shell would
+	// silently breach the sandbox boundary on any prompt-injected
+	// "make it fail in sandbox" trick AND would re-run a possibly
+	// wrong command in a different filesystem. Surface a hint
+	// instead so the LLM (or its operator-trained ChatBot) makes
+	// an explicit decision. In optional mode plain exec IS the host
+	// shell, so point there; in enforced mode only mention host_exec
+	// when the operator actually opted into registering it —
+	// suggesting a tool that doesn't exist just confuses the model.
+	if err != nil && looksLikeSandboxAbsence(err, out) {
+		if !buildinfo.IsSandboxEnforced() {
+			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine, retry WITHOUT sandbox:true — plain exec runs on the host here.]", err)
+		} else if buildinfo.IsHostExecAllowed() {
 			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine — e.g. `fastclaw upgrade`, `~/Downloads`, host CLI tools — retry with the `host_exec` tool instead.]", err)
 		}
-		return MetaSandboxPrefix + out, err
-	})
+	}
+	return MetaSandboxPrefix + out, err
 }
 
 // looksLikeSandboxAbsence sniffs an exec error / output for the common

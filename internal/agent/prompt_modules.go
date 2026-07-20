@@ -474,9 +474,15 @@ spirit of the refusal politely, do not pass the bracketed message through.`
 }
 
 // modSandbox emits sandbox/code-execution instructions. Only relevant
-// when the agent has a sandbox attached.
+// when the agent has a sandbox attached. Two flavors: enforced mode
+// (sandboxEnabled — the sandbox IS the execution environment, full
+// filesystem-layout briefing) and optional mode (sandboxOptional —
+// self-hosted, host is the default, sandbox reachable per call).
 func modSandbox(p *promptCtx) string {
 	if !p.cb.sandboxEnabled {
+		if p.cb.sandboxOptional {
+			return modSandboxOptional(p)
+		}
 		return ""
 	}
 	prompt := `# Code Execution Environment
@@ -573,6 +579,39 @@ Then in your final reply, write: ![](/workspace/output.png)`
 		prompt += "\n- The sandbox is a Docker container."
 	}
 	return prompt
+}
+
+// modSandboxOptional briefs the model for self-hosted installs where a
+// sandbox pool is attached but the HOST remains the default execution
+// environment. Key job: stop the model from assuming the sandbox rules
+// (container paths, "host paths do not exist") apply to plain exec.
+func modSandboxOptional(p *promptCtx) string {
+	backend := "Docker container"
+	if p.cb.sandboxBackend == "e2b" {
+		backend = "cloud-hosted E2B environment"
+	} else if p.cb.sandboxBackend == "boxlite" {
+		backend = "Boxlite container"
+	}
+	return `# Execution Environment (host by default, sandbox on request)
+You run on the operator's HOST machine: exec and the file tools act
+directly on the host, in the Working Directory above. Installing
+software the user asks for, reading their files, and running their CLIs
+all happen right there — this is a self-hosted install and the chatter
+is the operator, so host access is expected. Execute code immediately
+with exec when asked to compute or process something; don't just show it.
+
+An isolated sandbox (` + backend + `) is ALSO available as an opt-in
+tool: pass sandbox:true on an exec call to run that ONE command inside
+it. Inside the sandbox the filesystem is its own — working dir is
+/workspace, skills are mounted read-only at /skills/<name>, and host
+paths (/Users/..., /home/...) do not exist. Use sandbox:true when you
+want isolation for untrusted code, or the sandbox image's pre-installed
+toolchain; use plain exec for everything tied to the user's actual
+machine. The sandbox's /workspace maps to your session workspace (bind
+mount or post-exec sync), so files a sandboxed command writes there do
+reach the user — but never reference host absolute paths inside a
+sandbox:true command, and never reference /workspace or /skills paths
+in a plain host exec.`
 }
 
 // modTaskDelegation emits the task-delegation and progress-tracking

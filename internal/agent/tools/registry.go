@@ -293,6 +293,14 @@ type Registry struct {
 	// confusing "sh: python: command not found" instead of a clear
 	// "sandbox required but unavailable" error.
 	sandboxRequired bool
+	// sandboxProvider lazily resolves the per-session sandbox executor in
+	// OPTIONAL sandbox mode (self-hosted installs, where the host shell
+	// stays the default execution path). The exec tool calls it only when
+	// the model passes sandbox:true, so sessions that never ask for the
+	// sandbox never start a container. Set per-turn by bindSession; nil
+	// when no pool is configured or when sandbox is enforced (enforced
+	// mode swaps the whole toolset via SetExecutor instead).
+	sandboxProvider func(ctx context.Context) (sandbox.Executor, error)
 	// callerIsAdmin marks the chatter driving the current turn as the
 	// agent owner / per-channel admin. Set per-turn by the agent loop
 	// via SetCallerIsAdmin from isAdminChatter(msg); the file tools
@@ -481,6 +489,12 @@ func (r *Registry) readSystemFileForUser(ctx context.Context, userID, name strin
 // instead of leaking onto the host shell.
 func (r *Registry) SetSandboxRequired(required bool) {
 	r.sandboxRequired = required
+}
+
+// SetSandboxProvider installs (or clears, with nil) the lazy executor
+// resolver for optional-sandbox mode. See the sandboxProvider field doc.
+func (r *Registry) SetSandboxProvider(fn func(ctx context.Context) (sandbox.Executor, error)) {
+	r.sandboxProvider = fn
 }
 
 // SetSessionID scopes the registry's workspace.Store calls (write_file /

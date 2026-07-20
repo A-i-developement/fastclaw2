@@ -186,6 +186,11 @@ func attachSandboxToAgents(
 		for _, ag := range agentMgr.All() {
 			ag.SetSandboxPool(systemPool)
 		}
+		if buildinfo.IsSandboxEnforced() {
+			slog.Info("sandbox attached (enforced): all exec routed into sandbox", "user", userID)
+		} else {
+			slog.Info("sandbox attached (optional): host exec stays default, exec(sandbox:true) opts in per call", "user", userID)
+		}
 		return systemPool
 	}
 	if pathSandboxRequired() {

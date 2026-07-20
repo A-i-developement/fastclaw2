@@ -15,6 +15,7 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/goal"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -148,10 +149,19 @@ type Agent struct {
 // the container while the prompt still advertises host paths — model
 // dutifully writes `/Users/.../workspaces/<id>/foo` which 404s inside
 // the container. The two states must agree.
+//
+// The pool means two different things depending on the deploy mode
+// (buildinfo.IsSandboxEnforced): enforced (hosted / opt-in env) locks
+// ALL exec + file tools into the sandbox; optional (self-hosted
+// default) keeps the host as the execution environment and merely makes
+// the sandbox reachable per-call via exec(sandbox:true) — so the prompt
+// keeps advertising host paths and the host-shell fallback stays legal.
 func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 	a.sandboxPool = p
+	enforced := p != nil && buildinfo.IsSandboxEnforced()
 	if a.ctxBuilder != nil {
-		a.ctxBuilder.sandboxEnabled = p != nil
+		a.ctxBuilder.sandboxEnabled = enforced
+		a.ctxBuilder.sandboxOptional = p != nil && !enforced
 	}
 	// Tell the tool registry sandbox is required so its host-shell exec
 	// fallback refuses to run when bindSession can't bind an executor.
@@ -159,8 +169,9 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 	// exec actually using sandbox) must agree — without this, a Docker
 	// daemon hiccup turns into "sh: python: command not found" on the
 	// host instead of a clear "sandbox required but unavailable" error.
+	// Only in enforced mode: optional mode's host fallback is the point.
 	if a.registry != nil {
-		a.registry.SetSandboxRequired(p != nil)
+		a.registry.SetSandboxRequired(enforced)
 	}
 }
 
@@ -197,8 +208,24 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	}
 	a.registry.SetMessageContext(channel, accountID, sessionID)
 	if a.sandboxPool == nil {
+		a.registry.SetSandboxProvider(nil)
 		return
 	}
+	if !buildinfo.IsSandboxEnforced() {
+		// Optional-sandbox mode (self-hosted): the host stays the default
+		// execution environment, so DON'T spin up a container for every
+		// session. Hand the registry a lazy resolver instead — the exec
+		// tool calls it only when the model passes sandbox:true, and the
+		// pool caches per (agent, project, session) so repeat calls in a
+		// turn reuse the same container.
+		pool := a.sandboxPool
+		agentName := a.name
+		a.registry.SetSandboxProvider(func(ctx context.Context) (sandbox.Executor, error) {
+			return pool.Get(ctx, agentName, projectID, sessionID)
+		})
+		return
+	}
+	a.registry.SetSandboxProvider(nil)
 	ex, err := a.sandboxPool.Get(ctx, a.name, projectID, sessionID)
 	if err != nil {
 		// Error level (not warn) — when sandbox is required and we
@@ -304,10 +331,14 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// sandbox was REQUIRED for this agent — without that signal an
 	// executor-pool failure would silently fall through to /bin/sh on the
 	// host, defeating the security boundary the user asked for.
+	// Only when sandbox is a boundary (enforced): in optional mode
+	// (self-hosted default) the host shell IS the intended default and
+	// the sandbox is just a per-call tool, so sbCfg stays nil.
 	skillDirs := loader.AllSkillDirs()
 	tools.RegisterLoadSkill(registry, skillDirs)
+	sandboxEnforced := rc.Sandbox.Enabled && buildinfo.IsSandboxEnforced()
 	var sbCfg *tools.SandboxConfig
-	if rc.Sandbox.Enabled {
+	if sandboxEnforced {
 		sbCfg = &tools.SandboxConfig{Enabled: true}
 	}
 	tools.RegisterExecWithSkillEnv(registry, sbCfg, loader.SkillEnvVars, skillDirs)
@@ -331,7 +362,7 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		registry:             registry,
 		sessions:             session.NewManager(rc.Home + "/sessions"),
 		memory:               memory,
-		ctxBuilder:           newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, rc.Sandbox.Enabled, rc.Sandbox.Backend, rc.PromptMode),
+		ctxBuilder:           newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, sandboxEnforced, rc.Sandbox.Backend, rc.PromptMode),
 		hooks:                hooks,
 		model:                rc.Model,
 		maxTokens:            rc.MaxTokens,
@@ -3287,7 +3318,13 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	// executor itself has been swapped to Docker — model dutifully calls
 	// list_dir /Users/idoubi/.fastclaw/agents/<id>/agent and 404s in the
 	// container.
-	a.ctxBuilder.sandboxEnabled = rc.Sandbox.Enabled
+	enforced := rc.Sandbox.Enabled && buildinfo.IsSandboxEnforced()
+	a.ctxBuilder.sandboxEnabled = enforced
+	// Optional flag follows the POOL, not the config row: the opt-in
+	// sandbox is only real once attachSandboxToAgents / SetSandboxPool
+	// wired an executor pool; advertising it earlier would make the
+	// model call exec(sandbox:true) into a guaranteed error.
+	a.ctxBuilder.sandboxOptional = a.sandboxPool != nil && !buildinfo.IsSandboxEnforced()
 	a.ctxBuilder.sandboxBackend = rc.Sandbox.Backend
 	// Propagate per-agent prompt mode updates from dashboard saves.
 	// Without this, an operator switching an agent to chatbot mode in
