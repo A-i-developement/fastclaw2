@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -33,6 +34,12 @@ func newTestModel() *Model {
 	m.width, m.height, m.ready = 100, 40, true
 	return m
 }
+
+// plain strips SGR sequences so assertions can match rendered text; the
+// markdown renderer styles word by word, splitting phrases with escapes.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func plain(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
 func evt(typ string, kv ...string) cliclient.Event {
 	data := map[string]any{}
@@ -87,6 +94,124 @@ func TestConsecutiveToolCallsShareBlock(t *testing.T) {
 	m.handleStreamEvent(evt("tool_call", "id", "c2", "name", "write_file"))
 	if len(m.blocks) != 1 || len(m.blocks[0].Tools) != 2 {
 		t.Fatalf("expected one tool block with two tools, got %#v", m.blocks)
+	}
+}
+
+// A block may only reach scrollback once it can no longer change, and
+// never out of order — a running tool has to hold back the text behind it.
+func TestSyncCommitsOnlyFinalBlocksInOrder(t *testing.T) {
+	m := newTestModel()
+	m.querying = true
+
+	m.blocks = append(m.blocks, displayBlock{Kind: blockUser, Content: "hi"})
+	m.sync()
+	if m.committed != 1 {
+		t.Fatalf("user block should commit immediately, committed = %d", m.committed)
+	}
+
+	m.handleStreamEvent(evt("tool_call", "id", "c1", "name", "read_file"))
+	m.sync()
+	if m.committed != 1 {
+		t.Fatalf("unfinished tool block committed early, committed = %d", m.committed)
+	}
+
+	// Text after the pending tool must wait for it, not jump ahead.
+	m.handleStreamEvent(evt("content", "content", "done reading"))
+	m.sync()
+	if m.committed != 1 {
+		t.Fatalf("text jumped ahead of a pending tool, committed = %d", m.committed)
+	}
+
+	m.handleStreamEvent(evt("tool_result", "id", "c1", "result", "ok"))
+	m.sync()
+	if m.committed != len(m.blocks) {
+		t.Fatalf("committed = %d, want all %d blocks", m.committed, len(m.blocks))
+	}
+
+	out := plain(strings.Join(m.pending, ""))
+	if i, j := strings.Index(out, "read_file"), strings.Index(out, "done reading"); i < 0 || j < 0 || i > j {
+		t.Fatalf("tool line should precede the text that followed it:\n%s", out)
+	}
+}
+
+// A tool block stays open while the turn runs so consecutive calls fold
+// into it; once the turn ends it must commit even if nothing follows.
+func TestSyncCommitsTrailingToolBlockAfterTurn(t *testing.T) {
+	m := newTestModel()
+	m.querying = true
+	m.handleStreamEvent(evt("tool_call", "id", "c1", "name", "read_file"))
+	m.handleStreamEvent(evt("tool_result", "id", "c1", "result", "ok"))
+	m.sync()
+	if m.committed != 0 {
+		t.Fatalf("trailing tool block committed mid-turn, committed = %d", m.committed)
+	}
+
+	m.querying = false
+	m.sync()
+	if m.committed != 1 {
+		t.Fatalf("trailing tool block did not commit after the turn, committed = %d", m.committed)
+	}
+}
+
+// renderLive draws only what is still uncommitted; committed blocks are
+// the terminal's now, and redrawing them would duplicate them on screen.
+func TestRenderLiveExcludesCommittedBlocks(t *testing.T) {
+	m := newTestModel()
+	m.blocks = append(m.blocks, displayBlock{Kind: blockUser, Content: "committed text"})
+	m.sync()
+	if got := m.renderLive(); got != "" {
+		t.Fatalf("live region redrew committed content:\n%s", got)
+	}
+
+	m.querying = true
+	m.streamed.WriteString("streaming now")
+	if got := plain(m.renderLive()); !strings.Contains(got, "streaming now") {
+		t.Fatalf("live region missing the streaming tail:\n%s", got)
+	}
+}
+
+func TestRenderLiveIsCappedToLiveHeight(t *testing.T) {
+	m := newTestModel()
+	m.querying = true
+	m.streamed.WriteString(strings.Repeat("line\n", 200))
+
+	got := strings.Count(strings.TrimRight(m.renderLive(), "\n"), "\n") + 1
+	if got > m.liveHeight() {
+		t.Fatalf("live region = %d lines, exceeds cap %d", got, m.liveHeight())
+	}
+}
+
+// drainPending must never block the event loop: the printer it feeds
+// hands messages back to that same loop, so a blocking send deadlocks.
+// A full buffer has to leave the lines pending for the next message.
+func TestDrainPendingNeverBlocksAndRetries(t *testing.T) {
+	m := newTestModel()
+	m.printCh = make(chan string, 1)
+
+	m.blocks = append(m.blocks, displayBlock{Kind: blockSystem, Content: "first"})
+	m.sync()
+	m.drainPending()
+	if len(m.pending) != 0 {
+		t.Fatalf("first block was not handed to the printer: %v", m.pending)
+	}
+
+	// Buffer is full now; the next block must stay pending, not block.
+	m.blocks = append(m.blocks, displayBlock{Kind: blockSystem, Content: "second"})
+	m.sync()
+	m.drainPending()
+	if len(m.pending) == 0 {
+		t.Fatal("block was dropped instead of staying pending on a full buffer")
+	}
+
+	if got := plain(<-m.printCh); !strings.Contains(got, "first") {
+		t.Fatalf("printer got %q, want the first block", got)
+	}
+	m.drainPending()
+	if len(m.pending) != 0 {
+		t.Fatalf("deferred block was not retried once the buffer drained: %v", m.pending)
+	}
+	if got := plain(<-m.printCh); !strings.Contains(got, "second") {
+		t.Fatalf("printer got %q, want the second block", got)
 	}
 }
 

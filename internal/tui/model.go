@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -85,12 +84,19 @@ type Model struct {
 	height int
 	ready  bool
 
-	viewport     viewport.Model
-	spin         spinner.Model
-	input        *inputModel
-	userScrolled bool
+	spin  spinner.Model
+	input *inputModel
 
-	blocks []displayBlock
+	// blocks is the whole transcript, but only blocks[committed:] are
+	// still ours to draw: everything before that has been printed into
+	// the terminal's scrollback and can no longer be changed. pending
+	// holds blocks rendered this tick, waiting for drainPending.
+	blocks    []displayBlock
+	committed int
+	pending   []string
+	// printCh serializes scrollback writes; nil in tests, which read
+	// pending directly.
+	printCh chan string
 
 	// In-flight turn state.
 	querying        bool
@@ -157,7 +163,39 @@ func (m *Model) loadHistoryCmd() tea.Cmd {
 
 // ─── Update ─────────────────────────────────────────────
 
+// Update wraps the real handler so every block committed while handling
+// this message is handed to the printer in order.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := m.update(msg)
+	m.drainPending()
+	return model, cmd
+}
+
+// drainPending hands committed blocks to the printer goroutine.
+//
+// It deliberately does not go through tea.Println: Bubble Tea runs each
+// Update's cmd in its own goroutine, so print cmds from two consecutive
+// messages race and the transcript comes out shuffled (a turn's "Done"
+// line beating the reply it belongs to). One channel with one consumer
+// is the only way to keep scrollback in order.
+//
+// The send must never block — the consumer hands messages to the event
+// loop, so blocking here would deadlock it. On a full buffer the lines
+// stay pending and go out with the next message; the 1s tick guarantees
+// there is always one coming.
+func (m *Model) drainPending() {
+	if len(m.pending) == 0 || m.printCh == nil {
+		return
+	}
+	out := strings.TrimRight(strings.Join(m.pending, ""), "\n")
+	select {
+	case m.printCh <- out:
+		m.pending = m.pending[:0]
+	default:
+	}
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -166,28 +204,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Degenerate ptys (script/expect, some CI shells) report 0x0;
 		// rendering assumes sane minimums.
 		m.width, m.height = max(msg.Width, 20), max(msg.Height, 8)
-		if !m.ready {
-			m.ready = true
-			m.viewport = viewport.New(m.width, m.contentHeight())
-		} else {
-			m.viewport.Width = m.width
-			m.viewport.Height = m.contentHeight()
-		}
+		first := !m.ready
+		m.ready = true
 		m.input.SetWidth(m.width)
-		m.refreshViewport()
+		if first {
+			// The welcome screen is scrollback, not a live frame: it is
+			// printed once and then scrolls away like any other block.
+			m.pending = append(m.pending, m.renderWelcome())
+		}
+		m.sync()
 		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		if m.querying {
-			m.refreshViewport()
+			m.sync()
 		}
 		return m, cmd
 
 	case tickMsg:
 		if m.querying {
-			m.refreshViewport()
+			m.sync()
 		}
 		return m, m.tickCmd()
 
@@ -195,7 +233,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errMsg = "load history: " + msg.err.Error()
 		} else {
-			m.blocks = m.blocks[:0]
+			m.resetTranscript()
 			for _, h := range msg.msgs {
 				switch h.Role {
 				case "user":
@@ -208,13 +246,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appendSystem(fmt.Sprintf("Resumed session (%d messages)", len(msg.msgs)), false)
 			}
 		}
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 
 	case sessionPickerMsg:
 		if msg.err != nil {
 			m.errMsg = "load sessions: " + msg.err.Error()
-			m.refreshViewport()
+			m.sync()
 			return m, nil
 		}
 		items := make([]pickerItem, 0, len(msg.sessions))
@@ -235,7 +273,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamEvtMsg:
 		m.handleStreamEvent(msg.ev)
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 
 	case streamDoneMsg:
@@ -252,7 +290,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.queued = append(m.queued, msg.text)
 			m.appendSystem("Queued; will send when this turn finishes: "+msg.text, false)
 		}
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 
 	case shellResultMsg:
@@ -267,7 +305,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			out = "(no output)"
 		}
 		m.appendSystem(out, msg.err != nil)
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 	}
 
@@ -306,7 +344,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.ctrlCArm = time.Now()
 		m.appendSystem("Press Ctrl+C again to quit", false)
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 
 	case "ctrl+d":
@@ -315,10 +353,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "ctrl+l":
-		m.blocks = nil
+		m.resetTranscript()
 		m.errMsg = ""
-		m.refreshViewport()
-		return m, nil
+		return m, tea.ClearScreen
 
 	case "esc":
 		if m.querying {
@@ -330,18 +367,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
-		return m, nil
-
-	case "pgup", "ctrl+b":
-		m.viewport.HalfPageUp()
-		m.userScrolled = true
-		return m, nil
-
-	case "pgdown", "ctrl+f":
-		m.viewport.HalfPageDown()
-		if m.viewport.AtBottom() {
-			m.userScrolled = false
-		}
 		return m, nil
 
 	case "tab":
@@ -372,7 +397,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.appendSystem("$ "+shellCmd, false)
-		m.refreshViewport()
+		m.sync()
 		return m, func() tea.Msg {
 			out, err := exec.Command("bash", "-lc", shellCmd).CombinedOutput()
 			return shellResultMsg{output: string(out), err: err}
@@ -384,7 +409,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if strings.HasPrefix(text, "/") {
 		m.appendSystem("Unknown command "+text+"; type /help for available commands", true)
-		m.refreshViewport()
+		m.sync()
 		return m, nil
 	}
 
@@ -412,11 +437,15 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 	case "/new":
 		m.sessionID = cliclient.NewSessionID()
 		m.sessionTitle = ""
-		m.blocks = nil
+		m.resetTranscript()
 		m.appendSystem("Started a new session", false)
+		m.sync()
+		return m, tea.ClearScreen
 
 	case "/clear":
-		m.blocks = nil
+		m.resetTranscript()
+		m.sync()
+		return m, tea.ClearScreen
 
 	case "/web":
 		m.appendSystem("Web dashboard: "+m.client.BaseURL(), false)
@@ -430,7 +459,7 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 		client := m.client
 		m.sessionTitle = args
 		m.appendSystem("Renamed session: "+args, false)
-		m.refreshViewport()
+		m.sync()
 		return m, func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -466,7 +495,7 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 	case "/exit":
 		return m, tea.Quit
 	}
-	m.refreshViewport()
+	m.sync()
 	return m, nil
 }
 
@@ -475,9 +504,8 @@ func (m *Model) applyPickerChoice(kind pickerKind, it pickerItem) (tea.Model, te
 	case pickerSessions:
 		m.sessionID = it.ID
 		m.sessionTitle = it.Title
-		m.blocks = nil
-		m.refreshViewport()
-		return m, m.loadHistoryCmd()
+		m.resetTranscript()
+		return m, tea.Batch(tea.ClearScreen, m.loadHistoryCmd())
 	case pickerAgents:
 		for _, a := range m.agents {
 			if a.ID == it.ID {
@@ -487,9 +515,10 @@ func (m *Model) applyPickerChoice(kind pickerKind, it pickerItem) (tea.Model, te
 		}
 		m.sessionID = cliclient.NewSessionID()
 		m.sessionTitle = ""
-		m.blocks = nil
+		m.resetTranscript()
 		m.appendSystem(fmt.Sprintf("Switched to %s; started a new session", m.agent.Name), false)
-		m.refreshViewport()
+		m.sync()
+		return m, tea.ClearScreen
 	}
 	return m, nil
 }
@@ -506,9 +535,8 @@ func (m *Model) sendTurn(text string) tea.Cmd {
 	m.streamed.Reset()
 	m.streamedContent = false
 	m.toolsByID = make(map[string]*toolState)
-	m.userScrolled = false
 	m.blocks = append(m.blocks, displayBlock{Kind: blockUser, Content: text})
-	m.refreshViewport()
+	m.sync()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
@@ -640,7 +668,7 @@ func (m *Model) finishTurn(err error) (tea.Model, tea.Cmd) {
 	}
 	m.toolsByID = make(map[string]*toolState)
 	m.input.Focus()
-	m.refreshViewport()
+	m.sync()
 
 	if len(m.queued) > 0 && err == nil {
 		next := strings.Join(m.queued, "\n\n")
@@ -664,56 +692,92 @@ func (m *Model) appendSystem(content string, isErr bool) {
 
 // ─── View ───────────────────────────────────────────────
 
-func (m *Model) contentHeight() int {
-	// header(1) + activity/suggestions(variable, min 0) + input + status(1)
-	h := m.height - 4 - m.input.Height()
-	if h < 3 {
-		h = 3
-	}
-	return h
+// liveHeight caps the redrawn region so the frame always fits: anything
+// taller than this has to reach the user through scrollback instead.
+func (m *Model) liveHeight() int {
+	return max(m.height-m.input.Height()-5, 4)
 }
 
-func (m *Model) refreshViewport() {
+// sync commits every block that has reached its final form to
+// scrollback. Order is preserved, so a block behind an unfinished one
+// waits its turn — a still-running tool pins the text after it in the
+// live region until the result lands.
+func (m *Model) sync() {
 	if !m.ready {
 		return
 	}
-	m.viewport.Height = m.contentHeight()
-	m.viewport.SetContent(m.renderTranscript())
-	if !m.userScrolled {
-		m.viewport.GotoBottom()
+	for ; m.committed < len(m.blocks); m.committed++ {
+		blk := m.blocks[m.committed]
+		if !m.blockFinal(m.committed) {
+			return
+		}
+		m.pending = append(m.pending, m.renderBlock(blk)+"\n")
 	}
 }
 
-func (m *Model) renderTranscript() string {
-	if len(m.blocks) == 0 && !m.querying {
-		return m.renderWelcome()
+// blockFinal reports whether a block will never change again. Only tool
+// blocks are mutable: tool_result fills in each entry, and a following
+// tool_call appends to the same block.
+func (m *Model) blockFinal(i int) bool {
+	blk := m.blocks[i]
+	if blk.Kind != blockTool {
+		return true
 	}
+	if i == len(m.blocks)-1 && m.querying {
+		return false // more tool calls may still join this block
+	}
+	for _, t := range blk.Tools {
+		if !t.Done {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Model) renderBlock(blk displayBlock) string {
+	switch blk.Kind {
+	case blockUser:
+		return renderUserBlock(blk.Content, m.width)
+	case blockAssistant:
+		return renderAssistantBlock(blk.Content, m.width)
+	case blockTool:
+		return renderToolBlock(blk.Tools, m.spin.View())
+	case blockError:
+		return renderSystemBlock(blk.Content, true)
+	default:
+		return renderSystemBlock(blk.Content, false)
+	}
+}
+
+// renderLive draws the uncommitted tail: blocks still in flux plus the
+// text streaming in right now. Trimmed to its last liveHeight lines —
+// the full text reaches scrollback once the block is committed.
+func (m *Model) renderLive() string {
 	var b strings.Builder
-	for i, blk := range m.blocks {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		switch blk.Kind {
-		case blockUser:
-			b.WriteString(renderUserBlock(blk.Content, m.width))
-		case blockAssistant:
-			b.WriteString(renderAssistantBlock(blk.Content, m.width))
-		case blockTool:
-			b.WriteString(renderToolBlock(blk.Tools, m.spin.View()))
-		case blockSystem:
-			b.WriteString(renderSystemBlock(blk.Content, false))
-		case blockError:
-			b.WriteString(renderSystemBlock(blk.Content, true))
-		}
+	for _, blk := range m.blocks[m.committed:] {
+		b.WriteString(m.renderBlock(blk))
 	}
-	// Live streaming tail.
 	if m.querying {
 		if text := m.streamed.String(); strings.TrimSpace(text) != "" {
-			b.WriteString("\n")
 			b.WriteString(renderAssistantBlock(text, m.width))
 		}
 	}
-	return b.String()
+	out := strings.TrimRight(b.String(), "\n")
+	if out == "" {
+		return ""
+	}
+	lines := strings.Split(out, "\n")
+	if n := m.liveHeight(); len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// resetTranscript drops the transcript. Already-committed blocks live in
+// the terminal's scrollback, so the caller pairs this with tea.ClearScreen.
+func (m *Model) resetTranscript() {
+	m.blocks = nil
+	m.committed = 0
 }
 
 func (m *Model) renderWelcome() string {
@@ -739,24 +803,6 @@ func (m *Model) renderWelcome() string {
 	b.WriteString(styleTipBox.Render(renderTips()))
 	b.WriteString("\n")
 	return b.String()
-}
-
-func (m *Model) renderHeader() string {
-	left := " " + stylePrimary.Bold(true).Render("● FastClaw") +
-		styleMuted.Render(" · "+m.agent.Name)
-	if m.agent.Model != "" {
-		left += styleDim.Render(" · " + m.agent.Model)
-	}
-	title := m.sessionTitle
-	if title == "" {
-		title = m.sessionID
-	}
-	right := styleDim.Render(truncateANSI(title, 32) + " ")
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
-	return left + strings.Repeat(" ", gap) + right
 }
 
 func (m *Model) renderActivity() string {
@@ -794,6 +840,8 @@ func (m *Model) renderSlashSuggestions() string {
 	return stylePickerBox.Render(inner.String()) + "\n"
 }
 
+// renderStatusBar is the only persistent chrome left, so it carries the
+// agent identity the old header used to show.
 func (m *Model) renderStatusBar() string {
 	var parts []string
 	if m.querying {
@@ -801,16 +849,21 @@ func (m *Model) renderStatusBar() string {
 	} else {
 		parts = append(parts, styleMuted.Render("○ idle"))
 	}
+	parts = append(parts, styleMuted.Render(m.agent.Name))
+	if m.agent.Model != "" {
+		parts = append(parts, styleDim.Render(m.agent.Model))
+	}
 	if len(m.queued) > 0 {
 		parts = append(parts, styleMuted.Render(fmt.Sprintf("%d queued", len(m.queued))))
 	}
 	parts = append(parts, styleDim.Render(m.client.BaseURL()))
 	left := " " + strings.Join(parts, styleDim.Render(" │ "))
 
-	right := ""
-	if pct := m.viewport.ScrollPercent(); pct < 1.0 {
-		right = styleDim.Render(fmt.Sprintf("%d%% ", int(pct*100)))
+	title := m.sessionTitle
+	if title == "" {
+		title = m.sessionID
 	}
+	right := styleDim.Render(truncateANSI(title, 32) + " ")
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
@@ -823,10 +876,7 @@ func (m *Model) View() string {
 		return "\n  " + m.spin.View() + " Starting…\n"
 	}
 	var b strings.Builder
-	b.WriteString(m.renderHeader())
-	b.WriteString("\n")
-	b.WriteString(m.viewport.View())
-	b.WriteString("\n")
+	b.WriteString(m.renderLive())
 
 	if m.picker != nil {
 		b.WriteString(m.picker.View())
