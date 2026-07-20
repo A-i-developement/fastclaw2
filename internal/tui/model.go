@@ -719,14 +719,25 @@ func (m *Model) renderTranscript() string {
 func (m *Model) renderWelcome() string {
 	var b strings.Builder
 	b.WriteString("\n")
-	b.WriteString("  " + stylePrimary.Bold(true).Render("● FastClaw") + "\n\n")
-	b.WriteString("  " + styleMuted.Render("agent: ") + m.agent.Name)
-	if m.agent.Model != "" {
-		b.WriteString(styleMuted.Render("  ·  model: ") + m.agent.Model)
+	if art := renderBanner(m.width); art != "" {
+		b.WriteString(art + "\n\n")
+	} else {
+		b.WriteString("    " + stylePrimary.Bold(true).Render("● FastClaw") + "\n\n")
 	}
+	b.WriteString("    " + styleMuted.Render("AI agents factory"))
+	if v := m.opts.Version; v != "" {
+		b.WriteString("  " + styleDim.Render(v))
+	}
+	b.WriteString("\n\n")
+
+	b.WriteString("    " + styleMuted.Render("agent  "+m.agent.Name) + "\n")
+	if m.agent.Model != "" {
+		b.WriteString("    " + styleMuted.Render("model  "+m.agent.Model) + "\n")
+	}
+	b.WriteString("    " + styleMuted.Render("web    "+m.client.BaseURL()) + "\n\n")
+
+	b.WriteString(styleTipBox.Render(renderTips()))
 	b.WriteString("\n")
-	b.WriteString("  " + styleMuted.Render("web:   ") + m.client.BaseURL() + "\n\n")
-	b.WriteString("  " + styleDim.Render("Type a message to start; /help for commands and keys") + "\n")
 	return b.String()
 }
 

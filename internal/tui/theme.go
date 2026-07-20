@@ -30,4 +30,11 @@ var (
 			MarginLeft(2)
 
 	stylePickerSelected = lipgloss.NewStyle().Foreground(colPrimary).Bold(true)
+
+	// styleTipBox frames the key-binding hints on the welcome screen.
+	styleTipBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colDim).
+			Padding(0, 1).
+			MarginLeft(3)
 )

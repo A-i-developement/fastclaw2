@@ -132,6 +132,7 @@ func runChat(ctx context.Context, opts chatOptions) error {
 		Agents:      agents,
 		SessionID:   opts.session,
 		LoadHistory: resume,
+		Version:     version,
 	})
 }
 

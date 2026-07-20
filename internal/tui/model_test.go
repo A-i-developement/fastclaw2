@@ -144,3 +144,37 @@ func TestHelpTextListsCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestWelcomeRendersBannerAndSessionInfo(t *testing.T) {
+	m := newTestModel()
+	m.opts.Version = "v1.2.3"
+
+	welcome := m.renderWelcome()
+	for _, want := range []string{
+		bannerLines[0],
+		"AI agents factory",
+		"v1.2.3",
+		"agent  Coder",
+		"model  claude",
+		"web    http://127.0.0.1:18953",
+		"Shift+Enter",
+		"!cmd",
+	} {
+		if !strings.Contains(welcome, want) {
+			t.Fatalf("welcome screen missing %q:\n%s", want, welcome)
+		}
+	}
+}
+
+func TestWelcomeFallsBackToCompactTitleInNarrowTerminal(t *testing.T) {
+	m := newTestModel()
+	m.width = 40
+
+	welcome := m.renderWelcome()
+	if strings.Contains(welcome, bannerLines[0]) {
+		t.Fatalf("narrow welcome unexpectedly rendered the wide banner:\n%s", welcome)
+	}
+	if !strings.Contains(welcome, "● FastClaw") {
+		t.Fatalf("narrow welcome missing compact title:\n%s", welcome)
+	}
+}
