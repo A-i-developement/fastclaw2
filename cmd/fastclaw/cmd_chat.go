@@ -1,28 +1,22 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/glamour"
 	"github.com/spf13/cobra"
 
+	"github.com/fastclaw-ai/fastclaw/internal/cliclient"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/daemon"
+	"github.com/fastclaw-ai/fastclaw/internal/tui"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
@@ -33,26 +27,6 @@ type chatOptions struct {
 	baseURL      string
 	apiKey       string
 	continueLast bool
-}
-
-type cliAgent struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Model     string    `json:"model"`
-	CreatedAt time.Time `json:"createdAt"`
-}
-
-type cliSession struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Preview   string `json:"preview"`
-	UpdatedAt int64  `json:"updatedAt"`
-}
-
-type chatClient struct {
-	baseURL string
-	apiKey  string
-	http    *http.Client
 }
 
 func chatCmd() *cobra.Command {
@@ -119,8 +93,8 @@ func runChat(ctx context.Context, opts chatOptions) error {
 		}
 	}
 
-	c := &chatClient{baseURL: opts.baseURL, apiKey: opts.apiKey, http: &http.Client{}}
-	agents, err := c.agents(ctx)
+	c := cliclient.New(opts.baseURL, opts.apiKey)
+	agents, err := c.Agents(ctx)
 	if err != nil {
 		return fmt.Errorf("load agents: %w", err)
 	}
@@ -131,26 +105,34 @@ func runChat(ctx context.Context, opts chatOptions) error {
 	if err != nil {
 		return err
 	}
+	resume := opts.session != ""
 	if opts.continueLast && opts.session == "" {
-		sessions, err := c.sessions(ctx, agent.ID)
+		sessions, err := c.Sessions(ctx, agent.ID)
 		if err != nil {
 			return err
 		}
 		if len(sessions) > 0 {
 			opts.session = sessions[0].ID
+			resume = true
 		}
 	}
 	if opts.session == "" {
-		opts.session = newCLISessionID()
+		opts.session = cliclient.NewSessionID()
 	}
 
 	if opts.query != "" {
-		return c.stream(ctx, agent.ID, opts.session, opts.query, os.Stdout)
+		return plainStream(ctx, c, agent.ID, opts.session, opts.query, os.Stdout)
 	}
 	if !isInteractiveTerminal(os.Stdin, os.Stdout) {
 		return errors.New("interactive chat requires a terminal; use --query or pipe a message as an argument")
 	}
-	return runChatREPL(ctx, c, agent, opts.session)
+	return tui.Run(tui.Options{
+		Client:      c,
+		Agent:       agent,
+		Agents:      agents,
+		SessionID:   opts.session,
+		LoadHistory: resume,
+	})
 }
 
 func ensureGateway(ctx context.Context, baseURL string, port int) error {
@@ -234,64 +216,7 @@ func ensureCLIToken(ctx context.Context) (string, error) {
 	return token, nil
 }
 
-func (c *chatClient) request(ctx context.Context, method, path string, body any) (*http.Response, error) {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	return c.http.Do(req)
-}
-
-func (c *chatClient) agents(ctx context.Context) ([]cliAgent, error) {
-	resp, err := c.request(ctx, http.MethodGet, "/api/agents", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, responseError(resp)
-	}
-	var payload struct {
-		Agents []cliAgent `json:"agents"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	return payload.Agents, nil
-}
-
-func (c *chatClient) sessions(ctx context.Context, agentID string) ([]cliSession, error) {
-	resp, err := c.request(ctx, http.MethodGet, "/api/chat/sessions?agentId="+agentID, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, responseError(resp)
-	}
-	var payload struct {
-		Sessions []cliSession `json:"sessions"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	sort.SliceStable(payload.Sessions, func(i, j int) bool { return payload.Sessions[i].UpdatedAt > payload.Sessions[j].UpdatedAt })
-	return payload.Sessions, nil
-}
-
-func selectAgent(agents []cliAgent, wanted string) (cliAgent, error) {
+func selectAgent(agents []cliclient.Agent, wanted string) (cliclient.Agent, error) {
 	if wanted == "" {
 		// The API currently returns agents newest-first. The terminal's
 		// implicit default is the user's first-created agent, independent of
@@ -310,78 +235,14 @@ func selectAgent(agents []cliAgent, wanted string) (cliAgent, error) {
 			return agent, nil
 		}
 	}
-	return cliAgent{}, fmt.Errorf("agent %q not found", wanted)
+	return cliclient.Agent{}, fmt.Errorf("agent %q not found", wanted)
 }
 
-func runChatREPL(ctx context.Context, c *chatClient, agent cliAgent, sessionID string) error {
-	fmt.Printf("\n\033[1;36mFastClaw\033[0m · agent: \033[1m%s\033[0m", agent.Name)
-	if agent.Model != "" {
-		fmt.Printf(" · model: %s", agent.Model)
-	}
-	fmt.Printf("\nWeb: %s\n", c.baseURL)
-	fmt.Println("Type /help for commands.")
-	fmt.Println()
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for {
-		fmt.Printf("%sYou >%s ", ansiIf(true, "\033[1;32m"), ansiIf(true, "\033[0m"))
-		if !scanner.Scan() {
-			fmt.Println()
-			return scanner.Err()
-		}
-		text := strings.TrimSpace(scanner.Text())
-		if text == "" {
-			continue
-		}
-		switch {
-		case text == "/exit" || text == "/quit":
-			return nil
-		case text == "/help":
-			fmt.Println("/new  start a new chat    /sessions  list chats    /exit  quit")
-			continue
-		case text == "/new":
-			sessionID = newCLISessionID()
-			fmt.Println("Started a new chat.")
-			continue
-		case text == "/sessions":
-			sessions, err := c.sessions(ctx, agent.ID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "sessions: %v\n", err)
-				continue
-			}
-			for i, session := range sessions {
-				if i == 10 {
-					break
-				}
-				label := session.Title
-				if label == "" {
-					label = session.Preview
-				}
-				fmt.Printf("  %s  %s\n", session.ID, label)
-			}
-			continue
-		}
-		fmt.Printf("%sAgent >%s ", ansiIf(true, "\033[1;35m"), ansiIf(true, "\033[0m"))
-		if err := c.stream(ctx, agent.ID, sessionID, text, os.Stdout); err != nil {
-			fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
-		}
-	}
-}
-
-func (c *chatClient) stream(ctx context.Context, agentID, sessionID, message string, out io.Writer) error {
-	resp, err := c.request(ctx, http.MethodPost, "/api/chat/stream", map[string]any{
-		"agentId": agentID, "sessionId": sessionID, "message": message,
-	})
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return responseError(resp)
-	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 4096), 4*1024*1024)
-	interactive := shouldRenderMarkdown(out)
+// plainStream renders one turn as line-oriented text: markdown-rendered
+// when stdout is a terminal, clean plain text when piped. Used by the
+// one-shot --query / stdin path; the interactive path uses internal/tui.
+func plainStream(ctx context.Context, c *cliclient.Client, agentID, sessionID, message string, out io.Writer) error {
+	interactive := writerIsTerminal(out)
 	statusVisible := false
 	wrote := false
 	atLineStart := true
@@ -416,7 +277,7 @@ func (c *chatClient) stream(ctx context.Context, agentID, sessionID, message str
 		text := markdownBuffer.String()
 		cut := len(text)
 		if !force {
-			cut = completeMarkdownPrefix(text)
+			cut = tui.CompleteMarkdownPrefix(text)
 			if cut == 0 {
 				return
 			}
@@ -424,12 +285,7 @@ func (c *chatClient) stream(ctx context.Context, agentID, sessionID, message str
 		block := text[:cut]
 		markdownBuffer.Reset()
 		markdownBuffer.WriteString(text[cut:])
-		rendered, err := renderTerminalMarkdown(block)
-		if err != nil {
-			writeText(block)
-			return
-		}
-		writeText(rendered)
+		writeText(tui.RenderMarkdown(block, 100) + "\n")
 	}
 	writeContent := func(text string) {
 		if !interactive {
@@ -447,34 +303,29 @@ func (c *chatClient) stream(ctx context.Context, agentID, sessionID, message str
 		}
 		atLineStart = true
 	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+	finish := func() {
+		flushMarkdown(true)
+		clearStatus()
+		if wrote && !atLineStart {
+			fmt.Fprintln(out)
 		}
-		var event struct {
-			Type string         `json:"type"`
-			Data map[string]any `json:"data"`
-		}
-		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) != nil {
-			continue
-		}
-		switch event.Type {
+	}
+
+	err := c.Stream(ctx, agentID, sessionID, message, func(ev cliclient.Event) {
+		switch ev.Type {
 		case "content_delta":
-			delta, _ := event.Data["delta"].(string)
 			// Write every provider delta as it arrives. Buffering until done made
 			// the endpoint streaming in name only from a terminal user's view.
+			delta := ev.Str("delta")
 			writeContent(delta)
 			streamedContent = streamedContent || delta != ""
 		case "content":
 			if !streamedContent {
-				text, _ := event.Data["content"].(string)
-				writeContent(text)
+				writeContent(ev.Str("content"))
 			}
 			streamedContent = false
 		case "tool_call":
-			name, _ := event.Data["name"].(string)
-			id, _ := event.Data["id"].(string)
+			name, id := ev.Str("name"), ev.Str("id")
 			if id != "" && name != "" {
 				toolNames[id] = name
 			}
@@ -485,66 +336,27 @@ func (c *chatClient) stream(ctx context.Context, agentID, sessionID, message str
 				streamedContent = false
 			}
 		case "tool_result":
-			id, _ := event.Data["id"].(string)
-			name := toolNames[id]
-			result, _ := event.Data["result"].(string)
+			name := toolNames[ev.Str("id")]
 			startLine()
 			label := "done"
 			if name != "" {
 				label = name
 			}
 			fmt.Fprintf(out, "%s✓ %s%s", ansiIf(interactive, "\033[32m"), label, ansiIf(interactive, "\033[0m"))
-			if summary := toolResultSummary(result); summary != "" {
+			if summary := toolResultSummary(ev.Str("result")); summary != "" {
 				fmt.Fprintf(out, " %s%s%s", ansiIf(interactive, "\033[2m"), summary, ansiIf(interactive, "\033[0m"))
 			}
 			fmt.Fprintln(out)
 			wrote, atLineStart = true, true
-		case "error":
-			msg, _ := event.Data["message"].(string)
-			return errors.New(msg)
 		case "done":
-			flushMarkdown(true)
-			clearStatus()
-			if wrote && !atLineStart {
-				fmt.Fprintln(out)
-			}
-			return nil
+			finish()
 		}
+	})
+	if err != nil {
+		clearStatus()
+		return err
 	}
-	clearStatus()
-	flushMarkdown(true)
-	if wrote && !atLineStart {
-		fmt.Fprintln(out)
-	}
-	return scanner.Err()
-}
-
-// completeMarkdownPrefix returns the portion of a streamed response that is
-// safe to render without guessing how an unfinished Markdown construct ends.
-// A blank line closes normal blocks (paragraphs, lists, tables); fenced code
-// is held until its closing fence arrives, even when it contains blank lines.
-func completeMarkdownPrefix(text string) int {
-	inFence := false
-	lastComplete := 0
-	lineStart := 0
-	for lineStart < len(text) {
-		relEnd := strings.IndexByte(text[lineStart:], '\n')
-		if relEnd < 0 {
-			break
-		}
-		lineEnd := lineStart + relEnd
-		line := strings.TrimSpace(text[lineStart:lineEnd])
-		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
-			inFence = !inFence
-			if !inFence {
-				lastComplete = lineEnd + 1
-			}
-		} else if !inFence && line == "" {
-			lastComplete = lineEnd + 1
-		}
-		lineStart = lineEnd + 1
-	}
-	return lastComplete
+	return nil
 }
 
 func ansiIf(enabled bool, code string) string {
@@ -566,48 +378,11 @@ func toolResultSummary(result string) string {
 	return result
 }
 
-func shouldRenderMarkdown(out io.Writer) bool {
+func writerIsTerminal(out io.Writer) bool {
 	f, ok := out.(*os.File)
 	if !ok {
 		return false
 	}
 	stat, err := f.Stat()
 	return err == nil && stat.Mode()&os.ModeCharDevice != 0
-}
-
-func renderTerminalMarkdown(markdown string) (string, error) {
-	style := "dark"
-	// COLORFGBG's final field is the terminal background colour (0–6 are
-	// conventionally dark, 7–15 light). This keeps Glamour readable in light
-	// terminals instead of always forcing its dark-background palette.
-	if fields := strings.Split(os.Getenv("COLORFGBG"), ";"); len(fields) > 0 {
-		if bg, err := strconv.Atoi(fields[len(fields)-1]); err == nil && bg >= 7 {
-			style = "light"
-		}
-	}
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle(style),
-		glamour.WithWordWrap(100),
-	)
-	if err != nil {
-		return "", err
-	}
-	return renderer.Render(markdown)
-}
-
-func responseError(resp *http.Response) error {
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	var payload struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal(data, &payload) == nil && payload.Error != "" {
-		return fmt.Errorf("gateway returned %d: %s", resp.StatusCode, payload.Error)
-	}
-	return fmt.Errorf("gateway returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-}
-
-func newCLISessionID() string {
-	var suffix [3]byte
-	_, _ = rand.Read(suffix[:])
-	return fmt.Sprintf("cli-%d-%s", time.Now().UnixMilli(), hex.EncodeToString(suffix[:]))
 }

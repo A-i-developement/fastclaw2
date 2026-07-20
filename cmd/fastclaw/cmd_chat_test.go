@@ -9,10 +9,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fastclaw-ai/fastclaw/internal/cliclient"
 )
 
 func TestSelectAgent(t *testing.T) {
-	agents := []cliAgent{
+	agents := []cliclient.Agent{
 		{ID: "agt_1", Name: "Coder"},
 		{ID: "agt_2", Name: "Researcher"},
 	}
@@ -33,7 +35,7 @@ func TestSelectAgent(t *testing.T) {
 func TestSelectAgentDefaultsToFirstCreated(t *testing.T) {
 	first := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	latest := first.Add(time.Hour)
-	agents := []cliAgent{
+	agents := []cliclient.Agent{
 		{ID: "agt_latest", Name: "Latest", CreatedAt: latest},
 		{ID: "agt_first", Name: "First", CreatedAt: first},
 	}
@@ -47,57 +49,7 @@ func TestSelectAgentDefaultsToFirstCreated(t *testing.T) {
 	}
 }
 
-func TestRenderTerminalMarkdown(t *testing.T) {
-	got, err := renderTerminalMarkdown("**bold**\n\n- one\n- two\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(got, "**bold**") {
-		t.Fatalf("markdown syntax was not rendered: %q", got)
-	}
-	if !strings.Contains(got, "bold") || !strings.Contains(got, "one") {
-		t.Fatalf("rendered output lost content: %q", got)
-	}
-}
-
-func TestCompleteMarkdownPrefix(t *testing.T) {
-	tests := []struct {
-		name string
-		text string
-		want string
-	}{
-		{
-			name: "completed paragraph",
-			text: "**bold** paragraph\n\nunfinished",
-			want: "**bold** paragraph\n\n",
-		},
-		{
-			name: "unfinished paragraph",
-			text: "still arriving",
-			want: "",
-		},
-		{
-			name: "blank line inside fence",
-			text: "```go\nfmt.Println(1)\n\nmore",
-			want: "",
-		},
-		{
-			name: "closed fence",
-			text: "```go\nfmt.Println(1)\n\n```\nnext",
-			want: "```go\nfmt.Println(1)\n\n```\n",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cut := completeMarkdownPrefix(tt.text)
-			if got := tt.text[:cut]; got != tt.want {
-				t.Fatalf("complete prefix = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestChatClientStream(t *testing.T) {
+func TestPlainStream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Fatalf("authorization = %q", got)
@@ -110,9 +62,9 @@ func TestChatClientStream(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := &chatClient{baseURL: server.URL, apiKey: "test-token", http: server.Client()}
+	c := cliclient.NewWithHTTPClient(server.URL, "test-token", server.Client())
 	var out bytes.Buffer
-	if err := c.stream(context.Background(), "agt_1", "session-1", "hi", &out); err != nil {
+	if err := plainStream(context.Background(), c, "agt_1", "session-1", "hi", &out); err != nil {
 		t.Fatal(err)
 	}
 	if got := out.String(); got != "Hello world\n" {
@@ -132,7 +84,7 @@ func (w *observingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestChatClientStreamWritesDeltasAndToolProgress(t *testing.T) {
+func TestPlainStreamWritesDeltasAndToolProgress(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
@@ -145,8 +97,8 @@ func TestChatClientStreamWritesDeltasAndToolProgress(t *testing.T) {
 	defer server.Close()
 
 	out := &observingWriter{}
-	c := &chatClient{baseURL: server.URL, apiKey: "test-token", http: server.Client()}
-	if err := c.stream(context.Background(), "agt_1", "session-1", "hi", out); err != nil {
+	c := cliclient.NewWithHTTPClient(server.URL, "test-token", server.Client())
+	if err := plainStream(context.Background(), c, "agt_1", "session-1", "hi", out); err != nil {
 		t.Fatal(err)
 	}
 	out.mu.Lock()
@@ -164,13 +116,17 @@ func TestChatClientStreamWritesDeltasAndToolProgress(t *testing.T) {
 	}
 }
 
-func TestNewCLISessionID(t *testing.T) {
-	a := newCLISessionID()
-	b := newCLISessionID()
-	if !strings.HasPrefix(a, "cli-") {
-		t.Fatalf("session ID %q lacks cli prefix", a)
-	}
-	if a == b {
-		t.Fatalf("session IDs unexpectedly equal: %q", a)
+func TestPlainStreamErrorEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"data\":{\"message\":\"provider exploded\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	c := cliclient.NewWithHTTPClient(server.URL, "test-token", server.Client())
+	var out bytes.Buffer
+	err := plainStream(context.Background(), c, "agt_1", "session-1", "hi", &out)
+	if err == nil || !strings.Contains(err.Error(), "provider exploded") {
+		t.Fatalf("expected provider error, got %v", err)
 	}
 }
