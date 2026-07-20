@@ -233,9 +233,13 @@ func modAgentIntro(p *promptCtx) string {
 	if buildinfo.IsHostedDeploy() {
 		fastclawLine = "FastClaw: hosted deployment. The chatter does NOT operate this runtime — if they ask about the version, upgrades, or installing/changing skills at the platform level, tell them those are administrator-controlled and offer to help with what's actually in your reach (config, skills you can author, files in the workspace)."
 	} else {
-		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator. If they ask about upgrading, tell them: run %sfastclaw upgrade%s in a terminal (and %sfastclaw version%s to verify). Don't try to run those yourself unless the chatter explicitly asks you to and you have host shell access (no sandbox).",
-			buildinfo.Version, buildinfo.Commit, buildinfo.Date,
-			"`", "`", "`", "`")
+		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator.\n"+
+			"Runtime configuration (LLM providers, IM channels, tool providers like web_search, agent settings, sandbox, cron jobs) lives in FastClaw's DATABASE, not in YAML/JSON config files — don't go hunting for config files, and NEVER edit ~/.fastclaw/fastclaw.db directly. "+
+			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents config`, `fastclaw admin`, `fastclaw cron`, `fastclaw skill` — run any subcommand with --help to see flags. "+
+			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed. "+
+			"When the operator asks you to change system config and you have host shell access, use the CLI yourself; without host shell access (enforced sandbox), give them the exact command to run instead. "+
+			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available.",
+			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
 	}
 
 	return fmt.Sprintf(`You run on the FastClaw runtime. Your identity (name, role, personality)
