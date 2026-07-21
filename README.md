@@ -35,6 +35,12 @@ FastClaw is an **Agent Factory** — it creates, manages, and runs AI agents. Ea
 curl -fsSL https://raw.githubusercontent.com/fastclaw-ai/fastclaw/main/install.sh | bash
 ```
 
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iex(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fastclaw-ai/fastclaw/main/install.ps1')"
+```
+
 ## Quick Start
 
 ### 1. First Run
