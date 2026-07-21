@@ -2183,11 +2183,14 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	// Drop every config row owned by this user — both their own
-	// ('user_id=X, agent_id="') and any per-agent overrides they
-	// authored on someone else's agent ('user_id=X, agent_id=Y').
+	// Drop every config row owned by this user. configs has no user_id
+	// column — ownership lives in scope_id (scope="user" → scope_id=<uid>;
+	// per-user overrides authored on an agent → scope_id="<uid>/<agentID>").
+	// Mirror the agent-side delete above (scope_id = aid OR "%/"+aid) so we
+	// drop both this user's own rows and any overrides they authored.
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM configs WHERE user_id = %s", d.ph(1)), id); err != nil {
+		fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+		id, id+"/%"); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
