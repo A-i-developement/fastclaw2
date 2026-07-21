@@ -1766,6 +1766,7 @@ export interface AgentCronJob {
   channel: string;
   chatId: string;
   accountId?: string;
+  chatterId?: string;   // per-sender app_user / web login that created the job
   timezone: string;
   enabled: boolean;
   lastRun?: string;
