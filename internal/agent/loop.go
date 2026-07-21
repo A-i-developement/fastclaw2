@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -70,6 +71,8 @@ type Agent struct {
 	ftsStore        *store.FTSStore
 	piiScrubEnabled bool
 	memoryCfg       config.MemoryCfg
+	workspaceHistoryEnabled bool
+	history                 *workspace.History
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
 	// per-turn system-prompt hint that advertises SplitMessageMarker
 	// to the LLM (see renderChannelHints) AND stamps
@@ -239,6 +242,13 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	a.registry.SetExecutor(ex)
 }
 
+// newWorkspaceHistory builds the git-snapshot history store rooted under
+// FASTCLAW_HOME. Package-level helper so call sites where a local
+// `workspace` string shadows the workspace package can use it.
+func newWorkspaceHistory(homeDir string) *workspace.History {
+	return workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
+}
+
 // NewAgent creates a new Agent from a resolved config.
 func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string) *Agent {
 	return NewAgentWithSkillsCfg(rc, prov, mb, homeDir, config.SkillsCfg{})
@@ -248,6 +258,10 @@ func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBu
 func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string, fullCfg *config.Config) *Agent {
 	ag := NewAgentWithSkillsCfg(rc, prov, mb, homeDir, fullCfg.Skills)
 	ag.memoryCfg = fullCfg.Memory
+	ag.workspaceHistoryEnabled = fullCfg.WorkspaceHistory.Enabled
+	if ag.workspaceHistoryEnabled {
+		ag.history = newWorkspaceHistory(homeDir)
+	}
 	ag.piiScrubEnabled = fullCfg.Privacy.PIIScrubbing.Enabled
 	// splitReplies is plumbed inside NewAgentWithSkillsCfg so foreign-
 	// attached agents also pick up the toggle; don't re-stamp here.
@@ -412,6 +426,15 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// AutoPersist without specifying a cadence.
 	if rc.AutoPersist != nil {
 		ag.memoryCfg.AutoPersist.Enabled = *rc.AutoPersist
+	}
+	// Workspace history toggle — same per-agent pointer pattern as
+	// AutoPersist above (NewAgentWithSkillsCfg is the production path;
+	// the fullCfg copy in NewAgentWithFullCfg covers the system default).
+	if rc.WorkspaceHistory != nil {
+		ag.workspaceHistoryEnabled = *rc.WorkspaceHistory
+	}
+	if ag.workspaceHistoryEnabled && ag.history == nil {
+		ag.history = newWorkspaceHistory(homeDir)
 	}
 	if ag.memoryCfg.AutoPersist.EveryNTurns == 0 {
 		ag.memoryCfg.AutoPersist.EveryNTurns = 5
@@ -2655,6 +2678,30 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 				slog.Debug("skills learner error", "error", err)
 			}
 		}()
+	}
+
+	// Workspace version history: snapshot the session workspace at turn
+	// boundary (opt-in; LocalFS only — S3-backed stores skip). Commit
+	// here, not per tool write, because sandbox exec writes via the bind
+	// mount are invisible to this process; the turn boundary is the one
+	// consistency point that covers file tools, exec and uploads.
+	if a.workspaceHistoryEnabled && a.history != nil {
+		if ls, ok := a.workspaceStore.(workspace.LocalScoper); ok {
+			scope := msg.ChatID
+			if pid := a.registry.ProjectID(); pid != "" {
+				scope = pid + "-" + msg.ChatID
+			}
+			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
+			go func() {
+				// context.Background(): the turn ctx is cancelled when the HTTP
+				// handler returns, and a killed git leaves index.lock behind,
+				// silently breaking every later snapshot of this scope.
+				// runGit has its own 30s timeout as the bound.
+				if err := a.history.Commit(context.Background(), scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
+					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
+				}
+			}()
+		}
 	}
 }
 

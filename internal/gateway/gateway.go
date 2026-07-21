@@ -814,6 +814,7 @@ const (
 	NSSkillsInstall  = "skills.install"
 	NSSkillsEntries  = "skills.entries"
 	NSMemory         = "memory"
+	NSWorkspaceHistory = "workspaceHistory"
 	NSPrivacy        = "privacy"
 	NSSkillsLearner  = "skillsLearner"
 	NSHeartbeat      = "heartbeat"
