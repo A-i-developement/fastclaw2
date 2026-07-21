@@ -8,6 +8,11 @@ import (
 	"github.com/muesli/reflow/wordwrap"
 )
 
+const (
+	chatIndent             = ""
+	chatContinuationIndent = "  "
+)
+
 // blockKind discriminates displayBlock rendering.
 type blockKind int
 
@@ -17,6 +22,7 @@ const (
 	blockTool
 	blockSystem
 	blockError
+	blockCompletion
 )
 
 // toolState tracks one tool call's lifecycle inside a turn.
@@ -38,19 +44,19 @@ type displayBlock struct {
 
 func renderUserBlock(content string, width int) string {
 	var b strings.Builder
-	b.WriteString(styleDim.Render("  "+strings.Repeat("─", max(min(width-4, 60), 1))) + "\n")
-	b.WriteString("  " + styleUserPrompt.Render(">") + " ")
+	b.WriteString(styleDim.Render(chatIndent+strings.Repeat("─", max(min(width-2, 60), 1))) + "\n")
+	b.WriteString(chatIndent + styleUserPrompt.Render("•") + " ")
 
 	if len(content) > 4000 {
 		lines := strings.Count(content, "\n")
 		content = content[:2000] + fmt.Sprintf("\n… +%d lines …", lines)
 	}
-	wrapped := wordwrap.String(content, max(width-6, 20))
+	wrapped := wordwrap.String(content, max(width-4, 20))
 	for idx, line := range strings.Split(wrapped, "\n") {
 		if idx == 0 {
 			b.WriteString(line + "\n")
 		} else {
-			b.WriteString("    " + line + "\n")
+			b.WriteString(chatContinuationIndent + line + "\n")
 		}
 	}
 	return b.String()
@@ -61,8 +67,8 @@ func renderAssistantBlock(content string, width int) string {
 		return ""
 	}
 	var b strings.Builder
-	for _, line := range strings.Split(RenderMarkdown(content, width-4), "\n") {
-		b.WriteString("  " + line + "\n")
+	for _, line := range strings.Split(RenderMarkdown(content, width-2), "\n") {
+		b.WriteString(chatIndent + line + "\n")
 	}
 	return b.String()
 }
@@ -76,10 +82,17 @@ func renderSystemBlock(content string, isErr bool) string {
 	}
 	var b strings.Builder
 	for _, line := range strings.Split(content, "\n") {
-		b.WriteString("  " + style.Render(prefix+line) + "\n")
+		b.WriteString(chatIndent + style.Render(prefix+line) + "\n")
 		prefix = "  "
 	}
 	return b.String()
+}
+
+// renderCompletionBlock gives the turn boundary a blank row above it. The
+// composer's vertically-centred first row supplies the matching row below,
+// avoiding two consecutive blank rows between the status and input text.
+func renderCompletionBlock(content string) string {
+	return "\n" + renderSystemBlock(content, false)
 }
 
 func renderToolBlock(tools []*toolState, spinnerView string) string {
@@ -87,19 +100,19 @@ func renderToolBlock(tools []*toolState, spinnerView string) string {
 	for _, t := range tools {
 		switch {
 		case !t.Done:
-			b.WriteString(fmt.Sprintf("  %s %s %s\n",
+			b.WriteString(fmt.Sprintf("%s%s %s %s\n", chatIndent,
 				spinnerView,
 				styleToolName.Render(t.Name),
 				styleDim.Render(fmt.Sprintf("(%s)", formatDuration(time.Since(t.Started))))))
 		case t.IsError:
-			b.WriteString(fmt.Sprintf("  %s %s",
+			b.WriteString(fmt.Sprintf("%s%s %s", chatIndent,
 				styleError.Render("✗"), styleToolName.Render(t.Name)))
 			if t.Summary != "" {
 				b.WriteString(" " + styleMuted.Render(t.Summary))
 			}
 			b.WriteString("\n")
 		default:
-			b.WriteString(fmt.Sprintf("  %s %s",
+			b.WriteString(fmt.Sprintf("%s%s %s", chatIndent,
 				styleSuccess.Render("✓"), styleToolName.Render(t.Name)))
 			if t.Summary != "" {
 				b.WriteString(" " + styleMuted.Render(t.Summary))

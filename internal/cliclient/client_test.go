@@ -2,6 +2,7 @@ package cliclient
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,6 +45,29 @@ func TestStreamTruncatedWithoutDone(t *testing.T) {
 	err := c.Stream(context.Background(), "a", "s", "msg", func(Event) {})
 	if err == nil || !strings.Contains(err.Error(), "stream closed") {
 		t.Fatalf("expected truncated-stream error, got %v", err)
+	}
+}
+
+func TestStreamImagesSendsImageURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Message   string   `json:"message"`
+			ImageURLs []string `json:"imageUrls"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Message != "look" || len(body.ImageURLs) != 1 || body.ImageURLs[0] != "data:image/png;base64,eA==" {
+			t.Fatalf("request body = %#v", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer server.Close()
+
+	c := NewWithHTTPClient(server.URL, "tok", server.Client())
+	if err := c.StreamImages(context.Background(), "a", "s", "look", []string{"data:image/png;base64,eA=="}, func(Event) {}); err != nil {
+		t.Fatal(err)
 	}
 }
 

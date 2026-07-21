@@ -224,6 +224,28 @@ function generateSessionId() {
   return `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const PASTED_IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/avif": "avif",
+  "image/gif": "gif",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/svg+xml": "svg",
+  "image/webp": "webp",
+};
+
+// Clipboard image files are commonly all named `image.png`. Give every
+// paste a unique, useful name so uploading a second screenshot doesn't
+// overwrite the first one in the session workspace.
+function namePastedImage(file: File, pasteId: number, index: number): File {
+  const extension = PASTED_IMAGE_EXTENSIONS[file.type.toLowerCase()] || "png";
+  return new globalThis.File([file], `pasted-image-${pasteId}-${index + 1}.${extension}`, {
+    type: file.type || `image/${extension}`,
+    lastModified: Date.now(),
+  });
+}
+
 /** Convert raw history messages into UI ChatMessages, grouping tool calls with results. */
 function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
   const msgs: ChatMessage[] = [];
@@ -572,6 +594,7 @@ export function ChatScreen() {
   const stickToBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pasteIdRef = useRef(0);
 
   // Dedupe events arriving on both the active POST stream and the
   // parallel /api/chat/subscribe SSE — both subscribe to the same
@@ -1844,6 +1867,33 @@ export function ChatScreen() {
     setAttachments((prev) => [...prev, ...newFiles]);
   }, []);
 
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!canAttach) return;
+
+    // `items` is the most reliable source for screenshots, while `files`
+    // covers browsers that expose clipboard files without DataTransferItems.
+    const itemImages = Array.from(e.clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    const clipboardImages = itemImages.length > 0
+      ? itemImages
+      : Array.from(e.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+
+    if (clipboardImages.length === 0) return;
+
+    // The image is represented by the preview chips, so don't also paste
+    // the browser's text/html fallback (often a huge data URL) into input.
+    e.preventDefault();
+    pasteIdRef.current += 1;
+    const pasteId = Date.now() * 1000 + pasteIdRef.current;
+    const pastedFiles = clipboardImages.map((file, index) =>
+      namePastedImage(file, pasteId, index),
+    );
+    setAttachments((prev) => [...prev, ...pastedFiles]);
+    setSlashOpen(false);
+  }, [canAttach]);
+
   const removeAttachment = useCallback((idx: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== idx));
   }, []);
@@ -2491,6 +2541,7 @@ export function ChatScreen() {
                     ref={textareaRef}
                     value={input}
                     onChange={handleInputChange}
+                    onPaste={handlePaste}
                     onKeyDown={handleKeyDown}
                     onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
                     placeholder={
@@ -2588,6 +2639,7 @@ export function ChatScreen() {
                     ref={textareaRef}
                     value={input}
                     onChange={handleInputChange}
+                    onPaste={handlePaste}
                     onKeyDown={handleKeyDown}
                     onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
                     placeholder={

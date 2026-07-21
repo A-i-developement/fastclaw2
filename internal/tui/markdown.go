@@ -1,11 +1,10 @@
 package tui
 
 import (
-	"os"
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Cached renderer, rebuilt when the wrap width changes. Only touched
@@ -14,6 +13,7 @@ import (
 var (
 	mdRenderer *glamour.TermRenderer
 	mdWidth    int
+	mdStyle    string
 )
 
 func markdownRenderer(width int) *glamour.TermRenderer {
@@ -23,13 +23,14 @@ func markdownRenderer(width int) *glamour.TermRenderer {
 	if width > 120 {
 		width = 120
 	}
-	if mdRenderer == nil || mdWidth != width {
+	style := TerminalMarkdownStyle()
+	if mdRenderer == nil || mdWidth != width || mdStyle != style {
 		r, err := glamour.NewTermRenderer(
-			glamour.WithStandardStyle(TerminalMarkdownStyle()),
+			glamour.WithStandardStyle(style),
 			glamour.WithWordWrap(width),
 		)
 		if err == nil {
-			mdRenderer, mdWidth = r, width
+			mdRenderer, mdWidth, mdStyle = r, width, style
 		}
 	}
 	return mdRenderer
@@ -49,15 +50,13 @@ func RenderMarkdown(content string, width int) string {
 	return strings.TrimRight(out, "\n")
 }
 
-// TerminalMarkdownStyle picks glamour's light or dark style from the
-// COLORFGBG convention (final field ≥7 means a light background).
+// TerminalMarkdownStyle shares Lipgloss's background detection so Markdown
+// and the rest of the TUI cannot disagree when COLORFGBG is unavailable.
 func TerminalMarkdownStyle() string {
-	if fields := strings.Split(os.Getenv("COLORFGBG"), ";"); len(fields) > 0 {
-		if bg, err := strconv.Atoi(fields[len(fields)-1]); err == nil && bg >= 7 {
-			return "light"
-		}
+	if lipgloss.DefaultRenderer().HasDarkBackground() {
+		return "dark"
 	}
-	return "dark"
+	return "light"
 }
 
 // CompleteMarkdownPrefix returns the length of the leading portion of a

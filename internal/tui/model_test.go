@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/fastclaw-ai/fastclaw/internal/cliclient"
 )
 
@@ -21,18 +23,80 @@ func (fakeClient) History(context.Context, string, string) ([]cliclient.HistoryM
 func (fakeClient) Stream(context.Context, string, string, string, func(cliclient.Event)) error {
 	return nil
 }
+func (fakeClient) StreamImages(context.Context, string, string, string, []string, func(cliclient.Event)) error {
+	return nil
+}
 func (fakeClient) Steer(context.Context, string, string, string) (bool, error) { return false, nil }
 func (fakeClient) RenameSession(context.Context, string, string) error         { return nil }
 func (fakeClient) BaseURL() string                                             { return "http://127.0.0.1:18953" }
 
 func newTestModel() *Model {
 	m := NewModel(Options{
-		Client:    fakeClient{},
-		Agent:     cliclient.Agent{ID: "agt_1", Name: "Coder", Model: "claude"},
-		SessionID: "cli-test",
+		Client:     fakeClient{},
+		Agent:      cliclient.Agent{ID: "agt_1", Name: "Coder", Model: "claude"},
+		SessionID:  "cli-test",
+		WorkingDir: "/work/fastclaw",
 	})
 	m.width, m.height, m.ready = 100, 40, true
 	return m
+}
+
+func TestStatusBarOnlyShowsModelAndWorkingDirectory(t *testing.T) {
+	m := newTestModel()
+	m.querying = true
+	m.queued = []string{"next"}
+	m.pendingImages = []string{"data:image/png;base64,eA=="}
+
+	got := plain(m.renderStatusBar())
+	if !strings.Contains(got, "claude") || !strings.Contains(got, "/work/fastclaw") {
+		t.Fatalf("status bar missing model or cwd: %q", got)
+	}
+	for _, unwanted := range []string{"replying", "Coder", "127.0.0.1", "cli-test", "queued", "image"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("status bar contains %q: %q", unwanted, got)
+		}
+	}
+}
+
+func TestTruncatePathLeftPreservesProjectName(t *testing.T) {
+	got := truncatePathLeft("/Users/me/code/项目/fastclaw", 12)
+	if !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, "fastclaw") {
+		t.Fatalf("truncated path = %q", got)
+	}
+	if lipgloss.Width(got) > 12 {
+		t.Fatalf("truncated path width = %d, want <= 12", lipgloss.Width(got))
+	}
+}
+
+func TestCompactChatPrompts(t *testing.T) {
+	user := plain(renderUserBlock("hello", 80))
+	if !strings.Contains(user, "\n• hello\n") || strings.Contains(user, "\n •") {
+		t.Fatalf("user prompt is not compact or does not use a bullet:\n%s", user)
+	}
+
+	composer := newInputModel()
+	input := plain(composer.View())
+	inputLines := strings.Split(input, "\n")
+	if len(inputLines) != minInputHeight || !strings.HasPrefix(inputLines[1], "› ") {
+		t.Fatalf("composer prompt = %q, want compact › prompt", input)
+	}
+	if strings.Contains(inputLines[0], "›") || strings.Contains(inputLines[2], "›") {
+		t.Fatalf("composer repeated its prompt: %q", input)
+	}
+	if composer.Height() != minInputHeight {
+		t.Fatalf("composer height = %d, want %d", composer.Height(), minInputHeight)
+	}
+}
+
+func TestCompletionBlockHasVerticalPadding(t *testing.T) {
+	completion := plain(renderCompletionBlock("✦ Done in 5s"))
+	if !strings.HasPrefix(completion, "\n✦ Done in 5s\n") {
+		t.Fatalf("completion block lacks top padding: %q", completion)
+	}
+	composer := plain(newInputModel().View())
+	if !strings.Contains(completion+composer, "Done in 5s\n\n› ") {
+		t.Fatalf("completion and composer lack bottom padding: %q", completion+composer)
+	}
 }
 
 // plain strips SGR sequences so assertions can match rendered text; the
@@ -282,7 +346,7 @@ func TestWelcomeRendersBannerAndSessionInfo(t *testing.T) {
 		"agent  Coder",
 		"model  claude",
 		"web    http://127.0.0.1:18953",
-		"Shift+Enter",
+		"Ctrl+J",
 		"!cmd",
 	} {
 		if !strings.Contains(welcome, want) {

@@ -3,7 +3,24 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
+
+func TestTerminalMarkdownStyleMatchesLipglossBackground(t *testing.T) {
+	r := lipgloss.DefaultRenderer()
+	wasDark := r.HasDarkBackground()
+	defer r.SetHasDarkBackground(wasDark)
+
+	r.SetHasDarkBackground(false)
+	if got := TerminalMarkdownStyle(); got != "light" {
+		t.Fatalf("light background selected %q Markdown style", got)
+	}
+	r.SetHasDarkBackground(true)
+	if got := TerminalMarkdownStyle(); got != "dark" {
+		t.Fatalf("dark background selected %q Markdown style", got)
+	}
+}
 
 func TestRenderMarkdown(t *testing.T) {
 	got := RenderMarkdown("**bold**\n\n- one\n- two\n", 100)

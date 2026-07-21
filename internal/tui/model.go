@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +23,7 @@ type Client interface {
 	Sessions(ctx context.Context, agentID string) ([]cliclient.Session, error)
 	History(ctx context.Context, agentID, sessionID string) ([]cliclient.HistoryMessage, error)
 	Stream(ctx context.Context, agentID, sessionID, message string, on func(cliclient.Event)) error
+	StreamImages(ctx context.Context, agentID, sessionID, message string, imageURLs []string, on func(cliclient.Event)) error
 	Steer(ctx context.Context, agentID, sessionID, message string) (bool, error)
 	RenameSession(ctx context.Context, sessionID, title string) error
 	BaseURL() string
@@ -32,6 +35,8 @@ type Options struct {
 	Agent     cliclient.Agent
 	Agents    []cliclient.Agent
 	SessionID string
+	// WorkingDir is shown in the persistent footer. Empty uses os.Getwd.
+	WorkingDir string
 	// LoadHistory replays the session's archived turns on startup
 	// (used by --resume/--continue).
 	LoadHistory bool
@@ -58,6 +63,10 @@ type steerResultMsg struct {
 	buffered bool
 	err      error
 }
+type clipboardImageMsg struct {
+	dataURL string
+	err     error
+}
 type tickMsg time.Time
 
 type pickerKind int
@@ -77,8 +86,9 @@ type Model struct {
 	agent     cliclient.Agent
 	agents    []cliclient.Agent
 	sessionID string
-	// sessionTitle mirrors the picker/rename title for the status bar.
+	// sessionTitle mirrors the picker/rename title.
 	sessionTitle string
+	workingDir   string
 
 	width  int
 	height int
@@ -108,6 +118,8 @@ type Model struct {
 	toolsByID       map[string]*toolState
 	subagentNote    string
 	queued          []string
+	// pendingImages are native clipboard images attached to the compose box.
+	pendingImages []string
 
 	// Overlay picker.
 	picker     *pickerModel
@@ -122,18 +134,23 @@ type Model struct {
 
 // NewModel builds the chat model. Call SetProgram before Run.
 func NewModel(opts Options) *Model {
+	workingDir := opts.WorkingDir
+	if workingDir == "" {
+		workingDir, _ = os.Getwd()
+	}
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
 	sp.Style = lipgloss.NewStyle().Foreground(colPrimary)
 	return &Model{
-		opts:      opts,
-		client:    opts.Client,
-		agent:     opts.Agent,
-		agents:    opts.Agents,
-		sessionID: opts.SessionID,
-		spin:      sp,
-		input:     newInputModel(),
-		toolsByID: make(map[string]*toolState),
+		opts:       opts,
+		client:     opts.Client,
+		agent:      opts.Agent,
+		agents:     opts.Agents,
+		sessionID:  opts.SessionID,
+		workingDir: compactWorkingDir(workingDir),
+		spin:       sp,
+		input:      newInputModel(),
+		toolsByID:  make(map[string]*toolState),
 	}
 }
 
@@ -199,6 +216,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case clipboardImageMsg:
+		if msg.err != nil {
+			m.errMsg = "paste image: " + msg.err.Error()
+		} else {
+			m.pendingImages = append(m.pendingImages, msg.dataURL)
+			m.errMsg = ""
+		}
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		// Degenerate ptys (script/expect, some CI shells) report 0x0;
@@ -334,6 +360,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key {
+	case "ctrl+v":
+		return m, func() tea.Msg {
+			dataURL, err := clipboardImage()
+			return clipboardImageMsg{dataURL: dataURL, err: err}
+		}
+
 	case "ctrl+c":
 		if m.querying {
 			m.detachTurn()
@@ -348,7 +380,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+d":
-		if m.input.Value() == "" {
+		if m.input.Value() == "" && len(m.pendingImages) == 0 {
 			return m, tea.Quit
 		}
 
@@ -367,6 +399,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
+		m.pendingImages = nil
 		return m, nil
 
 	case "tab":
@@ -378,17 +411,30 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	submitted, cmd := m.input.Update(msg)
+	if key == "enter" && len(m.pendingImages) > 0 {
+		submitted = true
+	}
 	m.updateSlashMatches()
 	if !submitted {
 		return m, cmd
 	}
 
 	text := m.input.Value()
-	m.input.Reset()
-	m.slashMatches = nil
-	if text == "" {
+	images := append([]string(nil), m.pendingImages...)
+	if text == "" && len(images) == 0 {
 		return m, nil
 	}
+	if m.querying && len(images) > 0 {
+		m.errMsg = "image attachments cannot steer an active turn; wait for it to finish or press Esc to detach"
+		return m, nil
+	}
+	if len(images) > 0 && (strings.HasPrefix(text, "!") || strings.HasPrefix(text, "/")) {
+		m.errMsg = "image attachments cannot be used with local commands; press Esc to remove them"
+		return m, nil
+	}
+	m.input.Reset()
+	m.pendingImages = nil
+	m.slashMatches = nil
 
 	// Local shell escape.
 	if strings.HasPrefix(text, "!") {
@@ -417,7 +463,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Turn in flight: steer it (Claude Code-style follow-up).
 		return m, m.steerCmd(text)
 	}
-	return m, m.sendTurn(text)
+	return m, m.sendTurn(text, images)
 }
 
 func (m *Model) updateSlashMatches() {
@@ -525,7 +571,7 @@ func (m *Model) applyPickerChoice(kind pickerKind, it pickerItem) (tea.Model, te
 
 // ─── Turn lifecycle ─────────────────────────────────────
 
-func (m *Model) sendTurn(text string) tea.Cmd {
+func (m *Model) sendTurn(text string, images []string) tea.Cmd {
 	debugLog("sendTurn %q session=%s", text, m.sessionID)
 	m.querying = true
 	m.turnStart = time.Now()
@@ -535,7 +581,14 @@ func (m *Model) sendTurn(text string) tea.Cmd {
 	m.streamed.Reset()
 	m.streamedContent = false
 	m.toolsByID = make(map[string]*toolState)
-	m.blocks = append(m.blocks, displayBlock{Kind: blockUser, Content: text})
+	displayText := text
+	if displayText == "" {
+		displayText = "[image]"
+	}
+	if len(images) > 0 && text != "" {
+		displayText = fmt.Sprintf("[image ×%d]\n%s", len(images), text)
+	}
+	m.blocks = append(m.blocks, displayBlock{Kind: blockUser, Content: displayText})
 	m.sync()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -543,7 +596,7 @@ func (m *Model) sendTurn(text string) tea.Cmd {
 	client, agentID, sessionID := m.client, m.agent.ID, m.sessionID
 	program := m.program
 	return func() tea.Msg {
-		err := client.Stream(ctx, agentID, sessionID, text, func(ev cliclient.Event) {
+		err := client.StreamImages(ctx, agentID, sessionID, text, images, func(ev cliclient.Event) {
 			if program != nil {
 				program.Send(streamEvtMsg{ev: ev})
 			}
@@ -660,7 +713,10 @@ func (m *Model) finishTurn(err error) (tea.Model, tea.Cmd) {
 	}
 	switch {
 	case err == nil:
-		m.appendSystem("✦ Done in "+formatDuration(time.Since(m.turnStart)), false)
+		m.blocks = append(m.blocks, displayBlock{
+			Kind:    blockCompletion,
+			Content: "✦ Done in " + formatDuration(time.Since(m.turnStart)),
+		})
 	case errIsCancel(err):
 		m.appendSystem("Detached from this turn; the server keeps running and saves the reply (see /sessions)", false)
 	default:
@@ -673,7 +729,7 @@ func (m *Model) finishTurn(err error) (tea.Model, tea.Cmd) {
 	if len(m.queued) > 0 && err == nil {
 		next := strings.Join(m.queued, "\n\n")
 		m.queued = nil
-		return m, m.sendTurn(next)
+		return m, m.sendTurn(next, nil)
 	}
 	return m, nil
 }
@@ -744,6 +800,8 @@ func (m *Model) renderBlock(blk displayBlock) string {
 		return renderToolBlock(blk.Tools, m.spin.View())
 	case blockError:
 		return renderSystemBlock(blk.Content, true)
+	case blockCompletion:
+		return renderCompletionBlock(blk.Content)
 	default:
 		return renderSystemBlock(blk.Content, false)
 	}
@@ -817,7 +875,7 @@ func (m *Model) renderActivity() string {
 	if m.turnPending {
 		label = "Waiting for the follow-up turn…"
 	}
-	line := fmt.Sprintf("  %s %s %s",
+	line := fmt.Sprintf("%s%s %s %s", chatIndent,
 		m.spin.View(),
 		stylePrimary.Render(label),
 		styleMuted.Render("("+elapsed+" · Esc to detach)"))
@@ -840,35 +898,48 @@ func (m *Model) renderSlashSuggestions() string {
 	return stylePickerBox.Render(inner.String()) + "\n"
 }
 
-// renderStatusBar is the only persistent chrome left, so it carries the
-// agent identity the old header used to show.
+// renderStatusBar deliberately stays stable and sparse: the model explains
+// what is answering, while the working directory explains where it operates.
 func (m *Model) renderStatusBar() string {
-	var parts []string
-	if m.querying {
-		parts = append(parts, styleSuccess.Render("● replying"))
-	} else {
-		parts = append(parts, styleMuted.Render("○ idle"))
+	model := strings.TrimSpace(m.agent.Model)
+	if model == "" {
+		model = "default"
 	}
-	parts = append(parts, styleMuted.Render(m.agent.Name))
-	if m.agent.Model != "" {
-		parts = append(parts, styleDim.Render(m.agent.Model))
-	}
-	if len(m.queued) > 0 {
-		parts = append(parts, styleMuted.Render(fmt.Sprintf("%d queued", len(m.queued))))
-	}
-	parts = append(parts, styleDim.Render(m.client.BaseURL()))
-	left := " " + strings.Join(parts, styleDim.Render(" │ "))
+	separator := " │ "
+	available := max(m.width-1-lipgloss.Width(model)-lipgloss.Width(separator), 4)
+	dir := truncatePathLeft(m.workingDir, available)
+	return " " + styleMuted.Render(model) + styleDim.Render(separator+dir)
+}
 
-	title := m.sessionTitle
-	if title == "" {
-		title = m.sessionID
+func compactWorkingDir(dir string) string {
+	if dir == "" {
+		return "."
 	}
-	right := styleDim.Render(truncateANSI(title, 32) + " ")
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
+	home, err := os.UserHomeDir()
+	if err == nil && (dir == home || strings.HasPrefix(dir, home+string(filepath.Separator))) {
+		return "~" + strings.TrimPrefix(dir, home)
 	}
-	return left + strings.Repeat(" ", gap) + right
+	return dir
+}
+
+func truncatePathLeft(path string, width int) string {
+	if lipgloss.Width(path) <= width {
+		return path
+	}
+	if width <= 1 {
+		return "…"
+	}
+	runes := []rune(path)
+	start, used := len(runes), 1 // one cell for the ellipsis
+	for start > 0 {
+		runeWidth := lipgloss.Width(string(runes[start-1]))
+		if used+runeWidth > width {
+			break
+		}
+		start--
+		used += runeWidth
+	}
+	return "…" + string(runes[start:])
 }
 
 func (m *Model) View() string {

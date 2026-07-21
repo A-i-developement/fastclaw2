@@ -8,7 +8,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const maxInputHistory = 100
+const (
+	maxInputHistory = 100
+	minInputHeight  = 3
+)
 
 // inputModel wraps bubbles/textarea: multiline compose with Shift+Enter,
 // prompt history on up/down, and full IME support (CJK composition is
@@ -23,7 +26,7 @@ type inputModel struct {
 
 func newInputModel() *inputModel {
 	ta := textarea.New()
-	ta.Placeholder = "Type a message… (Enter to send, Shift+Enter for newline, / for commands)"
+	ta.Placeholder = "Send message"
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.MaxHeight = 10
@@ -34,7 +37,7 @@ func newInputModel() *inputModel {
 	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colDim)
 	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Foreground(colPrimary).Bold(true)
 	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Foreground(colDim)
-	ta.Prompt = "> "
+	ta.Prompt = "› "
 	ta.Focus()
 	ta.SetWidth(80)
 	return &inputModel{ta: ta, historyIdx: -1, width: 80}
@@ -69,11 +72,11 @@ func (i *inputModel) Reset() {
 func (i *inputModel) SetWidth(w int) {
 	i.width = w
 	if w > 6 {
-		i.ta.SetWidth(w - 4)
+		i.ta.SetWidth(w - 2)
 	}
 }
 
-func (i *inputModel) Height() int { return i.ta.Height() }
+func (i *inputModel) Height() int { return max(i.ta.Height(), minInputHeight) }
 
 // Update handles one key. Returns submit=true when Enter was pressed on
 // non-empty input.
@@ -141,5 +144,10 @@ func (i *inputModel) navigateHistory(direction int) {
 }
 
 func (i *inputModel) View() string {
-	return "  " + i.ta.View()
+	view := chatIndent + i.ta.View()
+	contentHeight := strings.Count(view, "\n") + 1
+	padding := max(i.Height()-contentHeight, 0)
+	top := padding / 2
+	bottom := padding - top
+	return strings.Repeat("\n", top) + view + strings.Repeat("\n", bottom)
 }

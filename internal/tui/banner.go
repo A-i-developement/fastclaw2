@@ -38,7 +38,7 @@ func renderTips() string {
 	pair := func(key, desc string) string {
 		return styleDim.Render(key) + styleMuted.Render(" "+desc)
 	}
-	return pair("Enter", "send") + pair("  Shift+Enter", "newline") + pair("  /help", "commands") +
+	return pair("Enter", "send") + pair("  Ctrl+J", "newline") + pair("  /help", "commands") +
 		"\n" +
 		pair("Ctrl+C", "interrupt") + pair("  Esc", "detach") +
 		pair("  Ctrl+L", "clear") + pair("  !cmd", "shell")

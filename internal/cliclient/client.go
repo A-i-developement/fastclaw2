@@ -182,8 +182,15 @@ func (c *Client) RenameSession(ctx context.Context, sessionID, title string) err
 // "done" ends the stream with nil. The callback runs on the reader
 // goroutine — TUI callers should forward events to their event loop.
 func (c *Client) Stream(ctx context.Context, agentID, sessionID, message string, on func(Event)) error {
+	return c.StreamImages(ctx, agentID, sessionID, message, nil, on)
+}
+
+// StreamImages is Stream with vision image attachments. imageURLs may contain
+// HTTPS URLs or data:image/* URLs; the latter is what the terminal clipboard
+// path uses so no temporary local file has to be exposed to the gateway.
+func (c *Client) StreamImages(ctx context.Context, agentID, sessionID, message string, imageURLs []string, on func(Event)) error {
 	resp, err := c.request(ctx, http.MethodPost, "/api/chat/stream", map[string]any{
-		"agentId": agentID, "sessionId": sessionID, "message": message,
+		"agentId": agentID, "sessionId": sessionID, "message": message, "imageUrls": imageURLs,
 	})
 	if err != nil {
 		return err

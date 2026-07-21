@@ -76,7 +76,8 @@ func helpText() string {
 	}
 	b.WriteString("\nKeys:\n")
 	b.WriteString("  Enter          send (during a reply: steer into the current turn)\n")
-	b.WriteString("  Shift+Enter    newline (or Ctrl+J)\n")
+	b.WriteString("  Ctrl+J         newline (or Alt+Enter; Shift+Enter where supported)\n")
+	b.WriteString("  Ctrl+V         attach an image from the system clipboard\n")
 	b.WriteString("  ↑ / ↓          input history\n")
 	b.WriteString("  PgUp / PgDn    scroll the transcript\n")
 	b.WriteString("  Esc            during a reply: detach (the server finishes and saves it)\n")
