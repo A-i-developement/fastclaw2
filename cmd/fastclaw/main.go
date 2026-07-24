@@ -114,6 +114,7 @@ func main() {
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(policyCmd())
 	rootCmd.AddCommand(daemonCmd())
+	rootCmd.AddCommand(logCmd())
 	rootCmd.AddCommand(adminCmd())
 	rootCmd.AddCommand(apikeyCmd())
 	rootCmd.AddCommand(agentsCmd())
@@ -133,7 +134,11 @@ func gatewayCmd() *cobra.Command {
 	var port int
 	cmd := &cobra.Command{
 		Use:   "gateway",
-		Short: "Start the FastClaw gateway",
+		Short: "Start the FastClaw gateway (foreground; use `fastclaw daemon` for background management)",
+		// NoArgs so `fastclaw gateway restart` errors instead of silently
+		// starting a second foreground gateway — restart/stop/status live
+		// under `fastclaw daemon`.
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runGateway(port)
 		},
