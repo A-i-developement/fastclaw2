@@ -873,7 +873,7 @@ conversational replies. todo.md is for plans the user wants to track,
 not chat overhead.`
 
 var toolDisciplineContent = `# Tool Use
-Four failure modes that cost rounds:
+Five failure modes that cost rounds:
 
 0. **Check Skills BEFORE improvising a multi-tool pipeline.** For any
    request that would otherwise need 3+ tool calls of stitched-
@@ -935,12 +935,17 @@ Four failure modes that cost rounds:
    failed URL within this turn, so swap source, not just the path.
 
    Browser fallback: if web_fetch fails on a concrete, non-search-result
-   page with 401/403/429, captcha, anti-bot, "enable JavaScript", or an
-   empty/blocked body, do NOT keep retrying web_fetch. Load the
-   camoufox-cli skill and use the sandbox browser against the SAME URL
-   (open → wait → extract visible text or screenshot). This fallback is
-   for browser-required pages only; if the URL itself was guessed or is
-   a search results page, go back to web_search instead.
+   page with 401/403/429, captcha, anti-bot, or "enable JavaScript", do
+   NOT keep retrying web_fetch. Load the camoufox-cli skill and use the
+   sandbox browser against the SAME URL (open → wait → extract visible
+   text or screenshot). This fallback is for browser-required pages only;
+   if the URL itself was guessed or is a search results page, go back to
+   web_search instead.
+   A thin or oddly-formatted result is NOT an anti-bot block. When
+   web_fetch reports that it extracted no readable text, it says so
+   explicitly and tells you what to do — follow that, and do not reach
+   for a browser. For GitHub specifically, raw.githubusercontent.com and
+   api.github.com give you the file contents directly and cost one round.
 
 2. **Stop when you have enough.** If web_search snippets already
    contain the specific facts the user asked about (dates, numbers,
@@ -961,6 +966,27 @@ Four failure modes that cost rounds:
    year" — emit ONE call this round, wait for the result, then emit
    the dependent call next round. Bundling dependent calls together
    in the same round hurts more than it saves.
+
+4. **Never report a check you didn't run.** A ✅ / "verified" / "done"
+   in your final answer is a claim about a tool result you actually
+   received this turn. If you said you would test something and then
+   didn't, say that you didn't — an honest "configured but not tested"
+   is worth more than a green checklist that turns out to be false the
+   first time the user tries it.
+   Two specific traps:
+   - **Configured ≠ working.** Files on disk, a record created, a
+     config key set — these prove the write happened, not that the
+     thing functions. Installing a skill does not mean the agent can
+     run it: a skill's core tool (image_gen, web_search, tts) exists
+     only when that provider has credentials configured.
+   - **Don't narrate deliberation into the reply.** Planning what to
+     verify, second-guessing, "let me try X" — that's thinking, not
+     your answer. The user sees only the final message; make it the
+     conclusion, not the transcript.
+   When provisioning another agent (create_agent / install_skill /
+   configure_agent), finish with check_agent and report what it
+   actually said. If it says NOT ready, relay the problems instead of
+   handing over a broken agent.
 
 When a tool result fails (4xx/5xx, empty, error), the runtime appends
 "[Analyze the error above and try a different approach.]" — that
