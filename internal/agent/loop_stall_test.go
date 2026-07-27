@@ -230,3 +230,98 @@ func TestUpdateSameToolFailStreak(t *testing.T) {
 	})
 }
 
+
+// The tool-call budget is the limit that actually fires in practice, yet
+// it warned nobody until now — only the wall-clock budget did. A turn
+// that plans five steps and gets cut off after four ends by reporting
+// the fifth as done, because the model never learned it was running out.
+func TestMaybeInjectIterationBudgetWarning_FiresOnceNearTheCap(t *testing.T) {
+	ctx := context.Background()
+	base := []provider.Message{{Role: "user", Content: "go"}}
+
+	// 13 of 20 used: 7 left, above the 30% threshold — stay quiet.
+	got, fired := maybeInjectIterationBudgetWarning(ctx, 13, 20, base, false)
+	if fired || len(got) != len(base) {
+		t.Fatalf("must not fire while budget is comfortable (fired=%v, msgs=%d)", fired, len(got))
+	}
+
+	// 14 of 20: 6 left, exactly at 30% — warn.
+	got, fired = maybeInjectIterationBudgetWarning(ctx, 14, 20, base, false)
+	if !fired {
+		t.Fatal("expected the warning to fire with 30% of the budget left")
+	}
+	if len(got) != len(base)+1 {
+		t.Fatalf("expected one appended system message, got %d", len(got))
+	}
+	warn := got[len(got)-1]
+	if warn.Role != "system" {
+		t.Errorf("warning should be a system message, got role %q", warn.Role)
+	}
+	for _, want := range []string{"Tool budget warning", "verification"} {
+		if !strings.Contains(warn.Content, want) {
+			t.Errorf("warning missing %q: %s", want, warn.Content)
+		}
+	}
+
+	// Already fired — never append twice in one turn.
+	got2, fired2 := maybeInjectIterationBudgetWarning(ctx, 18, 20, got, true)
+	if !fired2 || len(got2) != len(got) {
+		t.Errorf("warning must fire at most once per turn")
+	}
+}
+
+// A budget already spent has nothing to warn about — the cap nudge takes
+// over at that point.
+func TestMaybeInjectIterationBudgetWarning_NoBudgetNoFire(t *testing.T) {
+	ctx := context.Background()
+	base := []provider.Message{{Role: "user", Content: "go"}}
+	if _, fired := maybeInjectIterationBudgetWarning(ctx, 20, 20, base, false); fired {
+		t.Error("must not fire when the budget is already exhausted")
+	}
+	if _, fired := maybeInjectIterationBudgetWarning(ctx, 0, 0, base, false); fired {
+		t.Error("must not fire when no cap is configured")
+	}
+}
+
+// The cap-reached banner is rendered by exactly one consumer — the web
+// chat UI. On every other channel the metadata is dropped, so without an
+// in-band notice a guillotined turn arrives looking like a finished,
+// confident answer.
+func TestIterationCapNoticeReachesNonWebChannels(t *testing.T) {
+	if notice := iterationCapNotice("web", 20); notice != "" {
+		t.Errorf("web renders its own badge; text notice would duplicate it: %q", notice)
+	}
+	for _, ch := range []string{"wechat", "discord", "feishu", "line", "api", ""} {
+		notice := iterationCapNotice(ch, 20)
+		if notice == "" {
+			t.Errorf("channel %q silently drops the cap metadata and needs an in-band notice", ch)
+			continue
+		}
+		if !strings.Contains(notice, "20") {
+			t.Errorf("notice for %q should name the limit: %q", ch, notice)
+		}
+		if !strings.Contains(notice, "not necessarily verified") {
+			t.Errorf("notice for %q should undercut completion claims: %q", ch, notice)
+		}
+	}
+}
+
+// The forced-synthesis nudge used to push purely toward "deliver
+// content", which is how a truncated turn produced a confident
+// completion report with a tick next to a step that never ran.
+func TestCapReachedNudgeDemandsHonestyAboutTruncation(t *testing.T) {
+	msg := capReachedNudge(20)
+	if msg.Role != "system" {
+		t.Fatalf("nudge role = %q", msg.Role)
+	}
+	for _, want := range []string{
+		"ran out of tool budget",
+		"did not run",
+		"unless a tool result",
+		"configured but not verified",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Errorf("nudge should require honesty about %q:\n%s", want, msg.Content)
+		}
+	}
+}
