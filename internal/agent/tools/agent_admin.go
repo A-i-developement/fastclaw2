@@ -208,7 +208,8 @@ func RegisterAgentAdmin(r *Registry, deps AgentAdminDeps) {
 	r.Register(
 		"check_agent",
 		"Verify that an agent you own is actually able to do its job: model configured, skills installed, and the tools those skills declare they need actually available. "+
-			"Run this before reporting to the user that a newly provisioned agent is ready — installing a skill does NOT guarantee the agent can run it.",
+			"Run this before reporting to the user that a newly provisioned agent is ready — installing a skill does NOT guarantee the agent can run it. "+
+			"Always pass expect_skills listing the skills you installed this turn; without it the check can only describe what it finds, and a skill written to the wrong place looks identical to one that was never requested.",
 		map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -216,12 +217,18 @@ func RegisterAgentAdmin(r *Registry, deps AgentAdminDeps) {
 					"type":        "string",
 					"description": "Target agent name or agt_ id.",
 				},
+				"expect_skills": map[string]interface{}{
+					"type":        "array",
+					"items":       map[string]interface{}{"type": "string"},
+					"description": "Skills that MUST be present, e.g. the ones you just installed. Any that are missing are reported as failures.",
+				},
 			},
 			"required": []string{"agent"},
 		},
 		func(ctx context.Context, raw json.RawMessage) (string, error) {
 			var p struct {
-				Agent string `json:"agent"`
+				Agent        string   `json:"agent"`
+				ExpectSkills []string `json:"expect_skills"`
 			}
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return "", err
@@ -233,7 +240,7 @@ func RegisterAgentAdmin(r *Registry, deps AgentAdminDeps) {
 			if err != nil {
 				return "", err
 			}
-			return DiagnoseAgent(ctx, deps, rec.ID, rec.Name), nil
+			return DiagnoseAgent(ctx, deps, rec.ID, rec.Name, p.ExpectSkills...), nil
 		},
 	)
 }
@@ -269,7 +276,11 @@ func resolveOwnedAgent(ctx context.Context, deps AgentAdminDeps, ref string) (*s
 // exist and nothing ever checked. Every individual step succeeded; the
 // deliverable did not work. So this reports capability, and says
 // "unknown" where it cannot tell rather than implying health.
-func DiagnoseAgent(ctx context.Context, deps AgentAdminDeps, agentID, agentName string) string {
+// expectSkills names skills the caller believes it installed. Passing
+// them turns the check from "describe what's there" into "confirm what
+// was intended", which is the only version that catches a skill written
+// to the wrong directory.
+func DiagnoseAgent(ctx context.Context, deps AgentAdminDeps, agentID, agentName string, expectSkills ...string) string {
 	var b strings.Builder
 	problems := 0
 
@@ -285,9 +296,31 @@ func DiagnoseAgent(ctx context.Context, deps AgentAdminDeps, agentID, agentName 
 		fmt.Fprintf(&b, "  [ok]   model: %s\n", modelStr)
 	}
 
+	// Always name the directory that was scanned. Without it the report
+	// is unfalsifiable prose, and a model that dislikes the answer can
+	// talk itself out of it — one did, deciding this check "only reads
+	// registry metadata" and overriding a correct "no skills found" that
+	// was pointing straight at a skill copied one directory too high.
+	skillRoot := agentSkillRoot(deps, agentID)
 	skills := discoverAgentSkills(deps, agentID)
 	if len(skills) == 0 {
-		b.WriteString("  [--]   skills: none installed in this agent's private scope\n")
+		fmt.Fprintf(&b, "  [--]   skills: none found in %s (this is the ONLY directory this agent loads private skills from)\n",
+			displayPath(skillRoot))
+	}
+
+	// A skill the caller expected but cannot find is a hard failure, and
+	// the most likely cause is that it was written somewhere the agent
+	// does not read.
+	for _, want := range expectSkills {
+		want = strings.TrimSpace(want)
+		if want == "" {
+			continue
+		}
+		if !hasSkillNamed(skills, want) {
+			problems++
+			fmt.Fprintf(&b, "  [FAIL] skill %s: expected but NOT present in %s — it was not installed where this agent reads from; re-install it with install_skill(agent=…) rather than copying files by hand\n",
+				want, displayPath(skillRoot))
+		}
 	}
 
 	var avail map[string]bool
@@ -322,12 +355,53 @@ func DiagnoseAgent(ctx context.Context, deps AgentAdminDeps, agentID, agentName 
 	switch {
 	case problems > 0:
 		fmt.Fprintf(&b, "VERDICT: NOT ready — %d problem(s) above. Report these to the user instead of claiming the agent works.\n", problems)
+	case len(skills) == 0:
+		// "Model configured, zero skills" is a legitimate state for a
+		// plain conversational agent, so this is not a failure — but it
+		// must never render as an unqualified "ready". A provisioning run
+		// whose whole purpose was installing a skill got exactly that
+		// green light on an agent with no skills, and passed it on to the
+		// user as success.
+		b.WriteString("VERDICT: ready as a plain agent — but NO skills are installed. " +
+			"If this agent was just provisioned with a skill, that install did NOT land here and the task is not done.\n")
 	case deps.ToolAvailability == nil:
 		b.WriteString("VERDICT: configuration looks complete, but tool availability could not be verified in this deployment. Do not claim the agent is proven working.\n")
 	default:
 		b.WriteString("VERDICT: ready.\n")
 	}
 	return b.String()
+}
+
+// hasSkillNamed matches case-insensitively; skill directory names and the
+// names people type them by differ in case often enough to matter.
+func hasSkillNamed(skills []agentSkillInfo, name string) bool {
+	for _, s := range skills {
+		if strings.EqualFold(s.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// agentSkillRoot is the one directory an agent loads private skills from.
+// Returns "" when it can't be resolved, which displayPath renders as an
+// explicit unknown rather than an empty string.
+func agentSkillRoot(deps AgentAdminDeps, agentID string) string {
+	if deps.AgentHomeDir == nil {
+		return ""
+	}
+	home, err := deps.AgentHomeDir(agentID)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "skills")
+}
+
+func displayPath(p string) string {
+	if p == "" {
+		return "<agent skills dir: unresolved>"
+	}
+	return p
 }
 
 type agentSkillInfo struct {
@@ -339,14 +413,10 @@ type agentSkillInfo struct {
 // Best-effort: an unreadable directory yields no skills rather than an
 // error, since a missing skills dir just means none were installed.
 func discoverAgentSkills(deps AgentAdminDeps, agentID string) []agentSkillInfo {
-	if deps.AgentHomeDir == nil {
+	root := agentSkillRoot(deps, agentID)
+	if root == "" {
 		return nil
 	}
-	home, err := deps.AgentHomeDir(agentID)
-	if err != nil {
-		return nil
-	}
-	root := filepath.Join(home, "skills")
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil

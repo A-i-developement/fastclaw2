@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -2014,6 +2015,69 @@ func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, me
 	return append(messages, warnMsg), true
 }
 
+// pendingTodoItems returns the unchecked items in this session's
+// todo.md, or nil when there is no todo file (the common case — most
+// turns never write one).
+//
+// Reads through the workspace store rather than the filesystem so it
+// sees the same bytes write_file wrote, in every deployment.
+func (a *Agent) pendingTodoItems(ctx context.Context) []string {
+	if a.workspaceStore == nil || a.agentID == "" || a.registry == nil {
+		return nil
+	}
+	rc, err := a.workspaceStore.Get(ctx, a.agentID, a.registry.ProjectID(), a.registry.SessionID(), "todo.md")
+	if err != nil {
+		return nil
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(io.LimitReader(rc, 64<<10))
+	if err != nil {
+		return nil
+	}
+	return uncheckedTodoItems(string(body))
+}
+
+// uncheckedTodoItems parses the "- [ ] step" convention the UI renders.
+// Anything that isn't a checkbox line is prose and ignored, matching the
+// panel's own parser.
+func uncheckedTodoItems(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(trimmed, "- [ ]"); ok {
+			if item := strings.TrimSpace(rest); item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	return out
+}
+
+// todoReconcileNudge asks for one more pass when a turn is about to end
+// with its own checklist still showing unfinished work.
+//
+// The checklist is a promise rendered in the UI, and it drifts for a
+// mundane reason: something goes wrong mid-turn, the model firefights,
+// and never returns to the file. What the user then sees is a reply
+// saying "all done" beside a progress panel reading 1/5 — and there is
+// no way to tell from the outside which one is lying.
+//
+// Fires at most once per turn, and accepts "I did not finish these" as a
+// valid resolution — leaving an item unchecked is correct when the work
+// genuinely did not happen. What is not acceptable is the mismatch.
+func todoReconcileNudge(pending []string) provider.Message {
+	return provider.Message{
+		Role: "system",
+		Content: fmt.Sprintf(
+			"Before this reply goes out: todo.md still has %d unchecked item(s) — %s. "+
+				"The user sees that checklist as a live progress panel next to your answer, so it must not contradict what you are about to say. "+
+				"Resolve it one of two ways: edit_file('todo.md', …) to flip the items you actually completed, "+
+				"or keep them unchecked and say plainly in your reply which steps did not get done and why. "+
+				"Do not claim the task is complete while its own checklist says otherwise.",
+			len(pending), strings.Join(pending, "; ")),
+	}
+}
+
 // softIterationFraction is the share of the tool-call budget left when
 // the wrap-up warning fires. 0.30 of 20 leaves 6 calls — enough to close
 // out a multi-step task (finish the current step, verify, report) but
@@ -2316,6 +2380,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	turnStart := time.Now()
 	softDeadlineFired := false
 	iterBudgetWarned := false
+	todoReconciled := false
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2426,6 +2491,20 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				return emptyMsg
 			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
+
+			// Reconcile the checklist BEFORE the answer is emitted — once
+			// the user has read "all done", a corrected todo panel is just
+			// a second contradiction. Firing once per turn bounds this to
+			// one extra round and cannot loop.
+			if !todoReconciled {
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
+					todoReconciled = true
+					messages = append(messages, asst, todoReconcileNudge(pending))
+					continue
+				}
+				todoReconciled = true
+			}
+
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
 			if resp.Content != "" {
@@ -3074,6 +3153,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	turnStart := time.Now()
 	softDeadlineFired := false
 	iterBudgetWarned := false
+	todoReconciled := false
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
@@ -3118,6 +3198,22 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
+			// Reconcile the checklist before re-issuing as a stream. This
+			// path decides tool-calls-or-not with a non-streaming call
+			// first, which is the last moment nothing has been sent to the
+			// user yet — and this is the path the web UI uses, where the
+			// todo panel the answer would contradict is actually rendered.
+			if !todoReconciled {
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
+					todoReconciled = true
+					messages = append(messages,
+						provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, RawAssistant: resp.RawAssistant},
+						todoReconcileNudge(pending))
+					continue
+				}
+				todoReconciled = true
+			}
+
 			// Final response - use streaming
 			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 			if err != nil {

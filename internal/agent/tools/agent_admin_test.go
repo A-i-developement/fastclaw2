@@ -220,3 +220,79 @@ func TestCreateAgentPinsOwnership(t *testing.T) {
 		t.Errorf("new agent owner = %q, want the calling account %q", rec.UserID, ownerID)
 	}
 }
+
+// TestDiagnoseAgentZeroSkillsIsNotAConfidentReady covers the case that
+// slipped through in the field: a provisioning run whose skill install
+// landed in the wrong directory, on a check that answered "ready".
+//
+// Zero skills is legitimate for a plain conversational agent, so this is
+// not a hard failure — but it must never read as an unqualified green
+// light, and the report has to name the directory it scanned so the
+// finding can't be argued away.
+func TestDiagnoseAgentZeroSkillsIsNotAConfidentReady(t *testing.T) {
+	st := newTestStore(t)
+	agentID, ownerID := seedAgent(t, st, "bare")
+	if err := agentcli.SetConfig(context.Background(), st, agentID, "model", "anthropic/claude-sonnet-5"); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	deps := AgentAdminDeps{
+		Store:        st,
+		OwnerUserID:  ownerID,
+		AgentHomeDir: func(string) (string, error) { return home, nil },
+		ToolAvailability: func(context.Context, string) (map[string]bool, error) {
+			return map[string]bool{}, nil
+		},
+	}
+
+	report := DiagnoseAgent(context.Background(), deps, agentID, "bare")
+	if strings.Contains(report, "VERDICT: ready.") {
+		t.Fatalf("zero skills must not render as an unqualified ready:\n%s", report)
+	}
+	if !strings.Contains(report, "did NOT land here") {
+		t.Errorf("report should flag a provisioning miss:\n%s", report)
+	}
+	if !strings.Contains(report, filepath.Join(home, "skills")) {
+		t.Errorf("report must name the scanned directory so it can be checked:\n%s", report)
+	}
+}
+
+// expect_skills turns the check from "describe what's there" into
+// "confirm what was intended" — the only version that catches a skill
+// written one directory too high.
+func TestDiagnoseAgentFailsOnMissingExpectedSkill(t *testing.T) {
+	st := newTestStore(t)
+	agentID, ownerID := seedAgent(t, st, "expects")
+	if err := agentcli.SetConfig(context.Background(), st, agentID, "model", "anthropic/claude-sonnet-5"); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	deps := AgentAdminDeps{
+		Store:        st,
+		OwnerUserID:  ownerID,
+		AgentHomeDir: func(string) (string, error) { return home, nil },
+		ToolAvailability: func(context.Context, string) (map[string]bool, error) {
+			return map[string]bool{"image_gen": true}, nil
+		},
+	}
+
+	report := DiagnoseAgent(context.Background(), deps, agentID, "expects", "anthropic-art")
+	if !strings.Contains(report, "VERDICT: NOT ready") {
+		t.Fatalf("a missing expected skill must fail the check:\n%s", report)
+	}
+	if !strings.Contains(report, "expected but NOT present") {
+		t.Errorf("report should say the skill was expected:\n%s", report)
+	}
+
+	// Now actually install it where the agent reads from.
+	writeSkill(t, home, "anthropic-art", "metadata:\n  fastclaw:\n    requires:\n      tools: [image_gen]\n")
+	report = DiagnoseAgent(context.Background(), deps, agentID, "expects", "anthropic-art")
+	if !strings.Contains(report, "VERDICT: ready.") {
+		t.Errorf("expected skill present and satisfied should be ready:\n%s", report)
+	}
+
+	// Case-insensitive, since folder names and typed names differ.
+	if r := DiagnoseAgent(context.Background(), deps, agentID, "expects", "Anthropic-Art"); !strings.Contains(r, "VERDICT: ready.") {
+		t.Errorf("expected-skill matching should be case-insensitive:\n%s", r)
+	}
+}
