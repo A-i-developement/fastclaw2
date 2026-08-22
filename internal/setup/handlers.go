@@ -833,6 +833,7 @@ func sendProviderTestRequest(ctx context.Context, req testProviderRequest, testU
 	} else {
 		httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
 	}
+	provider.SetAppIdentityHeaders(httpReq.Header)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {

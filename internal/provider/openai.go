@@ -300,6 +300,7 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	SetAppIdentityHeaders(httpReq.Header)
 	return httpReq, nil
 }
 
